@@ -5,10 +5,12 @@ Then open http://127.0.0.1:5000 in your browser.
 """
 
 import csv
+import html
 import io
 import os
 import sqlite3
 import base64
+import re
 import textwrap
 
 import requests
@@ -20,10 +22,11 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    Image as RLImage, KeepTogether, HRFlowable,
+  Image as RLImage, KeepTogether, HRFlowable, PageBreak,
 )
 from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from PIL import Image as PILImage
+from PIL import ImageOps as PILImageOps
 
 BASE = "https://aimarker.replit.app"
 API_KEY = "vagEqbnj0uoocoXuqBQ69r7oYKlhbGWktPNorsYtTrz6PZRjLWE6aQ"
@@ -31,6 +34,7 @@ HEADERS = {"X-Api-Key": API_KEY}
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "candidates.db")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "candidates.csv")
+EVIDENCE_STATUS_CSV_PATH = os.path.join(os.path.dirname(__file__), "y11scores.csv")
 
 app = Flask(__name__)
 
@@ -103,6 +107,328 @@ def lookup_candidate(email: str):
     )
     row = cur.fetchone()
     return dict(row) if row else None
+
+
+def lookup_candidates_by_candidate_numbers(candidate_nos: list[str]) -> dict:
+  """Return candidate rows keyed by candidate number."""
+  clean_numbers = [str(candidate_no).strip() for candidate_no in candidate_nos if str(candidate_no).strip()]
+  if not clean_numbers:
+    return {}
+  placeholders = ",".join("?" for _ in clean_numbers)
+  cur = get_db().execute(
+    f"SELECT * FROM candidates WHERE candidate_no IN ({placeholders})",
+    clean_numbers,
+  )
+  return {row["candidate_no"]: dict(row) for row in cur.fetchall()}
+
+
+def parse_percentage(value: str | None) -> float | None:
+  if value is None:
+    return None
+  text = str(value).strip()
+  if not text:
+    return None
+  text = text.replace("%", "").strip()
+  try:
+    return float(text)
+  except ValueError:
+    return None
+
+
+def parse_code_list(value: str) -> list[str]:
+  seen = set()
+  codes = []
+  for part in re.split(r"[\n,]+", value or ""):
+    code = part.strip()
+    if not code or code in seen:
+      continue
+    seen.add(code)
+    codes.append(code)
+  return codes
+
+
+def attempt_percentage(attempt: dict) -> float | None:
+  pct = attempt.get("percentage")
+  if pct is not None:
+    try:
+      return float(pct)
+    except (TypeError, ValueError):
+      pass
+
+  awarded = attempt.get("marks_awarded")
+  possible = attempt.get("marks_possible")
+  if awarded is None or not possible:
+    return None
+
+  try:
+    return (float(awarded) / float(possible)) * 100
+  except (TypeError, ValueError, ZeroDivisionError):
+    return None
+
+
+def load_existing_evidence_rows() -> list:
+  """Load existing evidence scores from the local Year 11 CSV."""
+  if not os.path.exists(EVIDENCE_STATUS_CSV_PATH):
+    return []
+
+  rows = []
+  with open(EVIDENCE_STATUS_CSV_PATH, newline="", encoding="utf-8-sig") as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames or []
+    score_columns = [name for name in fieldnames if name not in {"Candidate #", "Student"}]
+    for row in reader:
+      candidate_no = (row.get("Candidate #") or "").strip()
+      if not candidate_no:
+        continue
+      existing_items = []
+      for column in score_columns:
+        score = parse_percentage(row.get(column))
+        if score is None:
+          continue
+        existing_items.append({
+          "label": column,
+          "percentage": score,
+          "display": f"{score:.0f}%",
+          "grade_label": grade_suggestion(score),
+          "grade_class": grade_badge_class(score),
+        })
+      rows.append({
+        "candidate_no": candidate_no,
+        "student_name": (row.get("Student") or "").strip(),
+        "existing_items": existing_items,
+        "evidence_count": len(existing_items),
+      })
+  return rows
+
+
+def fetch_quiz_attempt_groups(class_code: str, quiz_codes: list[str], include_questions: bool = False) -> dict:
+  """Fetch attempts for an explicit list of quiz codes."""
+  raw_by_quiz = {}
+  for quiz_code in quiz_codes:
+    data = fetch_grades(class_code, quiz_code, include_questions=include_questions)
+    raw_by_quiz[quiz_code] = data.get("attempts", [])
+  return raw_by_quiz
+
+
+def build_student_quiz_score_map(raw_by_quiz: dict) -> dict:
+  """Return best per-quiz score rows keyed by student email then quiz code."""
+  student_scores = {}
+  for quiz_code, attempts in raw_by_quiz.items():
+    for raw_attempt in attempts:
+      attempt = _normalise_attempt_questions(raw_attempt)
+      email = (attempt.get("student_email") or "").strip().lower()
+      if not email:
+        continue
+      percentage = attempt_percentage(attempt)
+      marks_possible = attempt.get("marks_possible") or 0
+      attempted_questions, total_questions = _question_attempt_progress(attempt)
+      current = {
+        "quiz_code": quiz_code,
+        "label": quiz_code,
+        "source_quiz_codes": [quiz_code],
+        "percentage": percentage,
+        "marks_awarded": attempt.get("marks_awarded"),
+        "marks_possible": marks_possible,
+        "minutes": round(marks_possible) if marks_possible else 0,
+        "attempted_questions": attempted_questions,
+        "total_questions": total_questions,
+        "attempt_date": _attempt_date(attempt),
+        "type": "single",
+      }
+      prev = student_scores.setdefault(email, {}).get(quiz_code)
+      prev_pct = prev.get("percentage") if prev else None
+      current_pct = current.get("percentage")
+      choose_current = prev is None
+      if not choose_current:
+        if current_pct is not None and prev_pct is None:
+          choose_current = True
+        elif current_pct is not None and prev_pct is not None and current_pct > prev_pct:
+          choose_current = True
+        elif current_pct == prev_pct:
+          current_date = current.get("attempt_date")
+          prev_date = prev.get("attempt_date")
+          choose_current = current_date is not None and (prev_date is None or current_date > prev_date)
+      if choose_current:
+        student_scores[email][quiz_code] = current
+  return student_scores
+
+
+def parse_merge_groups(value: str, valid_quiz_codes: list[str] | None = None, name_prefix: str | None = None) -> list:
+  """Parse merge groups from semicolon-separated groups of quiz codes."""
+  if not value.strip():
+    return []
+
+  valid_set = set(valid_quiz_codes or [])
+  groups = []
+  for raw_group in re.split(r"[;\n]+", value):
+    parts = []
+    for code in re.split(r"[+,]+", raw_group):
+      clean = code.strip()
+      if clean and clean not in parts:
+        parts.append(clean)
+    if len(parts) < 2:
+      continue
+    label = f"{name_prefix}{len(groups) + 1}" if name_prefix else " + ".join(parts)
+    groups.append({
+      "label": label,
+      "source_label": " + ".join(parts),
+      "quiz_codes": parts,
+      "unknown_codes": [code for code in parts if valid_set and code not in valid_set],
+    })
+  return groups
+
+
+def ensure_quiz_attempt_groups(class_code: str, raw_by_quiz: dict, quiz_codes: list[str], months_ago: int | None = None) -> dict:
+  """Ensure explicit quiz codes exist in the grouped attempts map."""
+  cutoff = _cutoff_date(months_ago)
+  for quiz_code in quiz_codes:
+    if quiz_code in raw_by_quiz:
+      continue
+    try:
+      data = fetch_grades(class_code, quiz_code)
+      raw_by_quiz[quiz_code] = _filter_attempts_by_date(data.get("attempts", []), cutoff)
+    except Exception:
+      raw_by_quiz[quiz_code] = []
+  return raw_by_quiz
+
+
+def _merged_percentage(items: list[dict]) -> float | None:
+  if not items:
+    return None
+
+  total_marks = sum(item.get("marks_possible") or 0 for item in items)
+  valid_percentages = [item.get("percentage") for item in items if item.get("percentage") is not None]
+  if not valid_percentages:
+    return None
+
+  if total_marks > 0 and len(valid_percentages) == len(items):
+    return sum((item.get("percentage") or 0) * (item.get("marks_possible") or 0) for item in items) / total_marks
+  return sum(valid_percentages) / len(valid_percentages)
+
+
+def build_merged_quiz_summaries(raw_by_quiz: dict, merge_groups: list) -> tuple:
+  """Build merged quiz summaries plus per-student merged score rows."""
+  if not merge_groups:
+    return [], {}
+
+  source_summaries = {item["quiz_code"]: item for item in _summaries_from_groups(raw_by_quiz)}
+  student_scores = build_student_quiz_score_map(raw_by_quiz)
+  merged_infos = []
+  merged_details = {}
+
+  for group in merge_groups:
+    source_infos = [
+      source_summaries.get(
+        quiz_code,
+        {
+          "quiz_code": quiz_code,
+          "label": quiz_code,
+          "source_quiz_codes": [quiz_code],
+          "source_label": quiz_code,
+          "est_minutes": 0,
+          "avg_marks_possible": 0,
+          "avg_percentage": None,
+          "attempt_count": 0,
+          "latest_date": None,
+          "type": "single",
+        },
+      )
+      for quiz_code in group["quiz_codes"]
+    ]
+
+    student_rows = []
+    latest_attempt = None
+    for email, score_map in sorted(student_scores.items()):
+      items = [score_map.get(quiz_code) for quiz_code in group["quiz_codes"]]
+      if any(item is None or item.get("percentage") is None for item in items):
+        continue
+
+      merged_pct = _merged_percentage(items)
+      merged_marks = sum(item.get("marks_possible") or 0 for item in items)
+      merged_minutes = sum(item.get("minutes") or 0 for item in items)
+      attempt_dates = [item.get("attempt_date") for item in items if item.get("attempt_date") is not None]
+      student_latest = max(attempt_dates) if attempt_dates else None
+      if student_latest is not None and (latest_attempt is None or student_latest > latest_attempt):
+        latest_attempt = student_latest
+
+      student_rows.append({
+        "email": email,
+        "percentage": merged_pct,
+        "marks_possible": merged_marks,
+        "total_minutes": merged_minutes,
+        "component_percentages": {item["quiz_code"]: item.get("percentage") for item in items},
+        "attempt_date": student_latest,
+      })
+
+    avg_marks_possible = sum(info.get("avg_marks_possible") or 0 for info in source_infos)
+    avg_percentage = None
+    if student_rows:
+      avg_percentage = sum(row.get("percentage") or 0 for row in student_rows if row.get("percentage") is not None) / len(student_rows)
+      if not avg_marks_possible:
+        avg_marks_possible = sum(row.get("marks_possible") or 0 for row in student_rows) / len(student_rows)
+
+    merged_infos.append({
+      "quiz_code": group["label"],
+      "label": group["label"],
+      "source_quiz_codes": group["quiz_codes"],
+      "source_label": group["source_label"],
+      "est_minutes": round(avg_marks_possible),
+      "avg_marks_possible": avg_marks_possible,
+      "avg_percentage": avg_percentage,
+      "attempt_count": len(student_rows),
+      "latest_date": latest_attempt.strftime("%d %b %Y") if latest_attempt else None,
+      "type": "merged",
+    })
+    merged_details[group["label"]] = student_rows
+
+  return merged_infos, merged_details
+
+
+def build_merged_score_rows(score_map: dict, merge_groups: list) -> list:
+  merged_rows = []
+  for group in merge_groups:
+    missing = []
+    components = []
+    if group["unknown_codes"]:
+      merged_rows.append({
+        "label": group["label"],
+        "percentage": None,
+        "total_minutes": None,
+        "missing": group["unknown_codes"],
+      })
+      continue
+
+    for quiz_code in group["quiz_codes"]:
+      item = score_map.get(quiz_code)
+      if not item or item.get("percentage") is None:
+        missing.append(quiz_code)
+        continue
+      components.append(item)
+
+    if missing:
+      merged_rows.append({
+        "label": group["label"],
+        "percentage": None,
+        "total_minutes": None,
+        "missing": missing,
+      })
+      continue
+
+    total_marks = sum(item.get("marks_possible") or 0 for item in components)
+    if total_marks > 0:
+      percentage = sum((item.get("percentage") or 0) * (item.get("marks_possible") or 0) for item in components) / total_marks
+    else:
+      percentage = sum(item.get("percentage") or 0 for item in components) / len(components)
+
+    merged_rows.append({
+      "label": group["label"],
+      "percentage": percentage,
+      "total_minutes": sum(item.get("minutes") or 0 for item in components),
+      "attempted_questions": sum(item.get("attempted_questions") or 0 for item in components),
+      "total_questions": sum(item.get("total_questions") or 0 for item in components),
+      "missing": [],
+    })
+  return merged_rows
 
 
 # ---------------------------------------------------------------------------
@@ -266,24 +592,29 @@ def discover_quiz_summaries(
 
 
 def _summaries_from_groups(grouped: dict) -> list:
-    result = []
-    for qc, attempts in grouped.items():
-        possible_values = [a.get("marks_possible") for a in attempts if a.get("marks_possible") is not None]
-        pct_values = [a.get("percentage") for a in attempts if a.get("percentage") is not None]
-        avg_possible = sum(possible_values) / len(possible_values) if possible_values else 0
-        avg_pct = sum(pct_values) / len(pct_values) if pct_values else None
-        dates = [_attempt_date(a) for a in attempts]
-        dates = [d for d in dates if d is not None]
-        latest = max(dates).strftime("%d %b %Y") if dates else None
-        result.append({
-            "quiz_code": qc,
-            "est_minutes": round(avg_possible),
-            "avg_marks_possible": avg_possible,
-            "avg_percentage": avg_pct,
-            "attempt_count": len(attempts),
-            "latest_date": latest,
-        })
-    return result
+  result = []
+  for qc, attempts in grouped.items():
+    possible_values = [a.get("marks_possible") for a in attempts if a.get("marks_possible") is not None]
+    pct_values = [attempt_percentage(a) for a in attempts]
+    pct_values = [value for value in pct_values if value is not None]
+    avg_possible = sum(possible_values) / len(possible_values) if possible_values else 0
+    avg_pct = sum(pct_values) / len(pct_values) if pct_values else None
+    dates = [_attempt_date(a) for a in attempts]
+    dates = [d for d in dates if d is not None]
+    latest = max(dates).strftime("%d %b %Y") if dates else None
+    result.append({
+      "quiz_code": qc,
+      "label": qc,
+      "source_quiz_codes": [qc],
+      "source_label": qc,
+      "est_minutes": round(avg_possible),
+      "avg_marks_possible": avg_possible,
+      "avg_percentage": avg_pct,
+      "attempt_count": len(attempts),
+      "latest_date": latest,
+      "type": "single",
+    })
+  return result
 
 
 def compute_per_student_evidence(
@@ -291,27 +622,43 @@ def compute_per_student_evidence(
     target_min: int = 50,
     target_max: int = 70,
     top_n: int = 3,
+    merge_groups: list | None = None,
 ) -> list:
     """Build per-student best evidence from {quiz_code: [attempts]} mapping.
     For each student uses their own percentage (best attempt per quiz)."""
-    student_best = {}  # email -> quiz_code -> best quiz entry
-    for qc, attempts in raw_by_quiz.items():
-        for a in attempts:
-            email = (a.get("student_email") or "").strip().lower()
-            if not email:
+    student_best = build_student_quiz_score_map(raw_by_quiz)
+
+    for quiz_map in student_best.values():
+        for item in list(quiz_map.values()):
+            item.setdefault("est_minutes", item.get("minutes") or round(item.get("marks_possible") or 0))
+            item.setdefault("avg_marks_possible", item.get("marks_possible") or 0)
+            item.setdefault("avg_percentage", item.get("percentage"))
+            item.setdefault("attempt_count", 1)
+            item.setdefault("latest_date", item.get("attempt_date"))
+
+        for group in merge_groups or []:
+            items = [quiz_map.get(quiz_code) for quiz_code in group["quiz_codes"]]
+            if any(item is None or item.get("percentage") is None for item in items):
                 continue
-            possible = a.get("marks_possible") or 0
-            pct = a.get("percentage")
-            prev = student_best.get(email, {}).get(qc)
-            if prev is None or (pct or 0) > (prev.get("avg_percentage") or 0):
-                student_best.setdefault(email, {})[qc] = {
-                    "quiz_code": qc,
-                    "est_minutes": round(possible) if possible else 0,
-                    "avg_marks_possible": possible,
-                    "avg_percentage": pct,
-                    "attempt_count": 1,
-                    "latest_date": None,
-                }
+
+            merged_marks = sum(item.get("marks_possible") or 0 for item in items)
+            merged_minutes = sum(item.get("minutes") or 0 for item in items)
+            merged_pct = _merged_percentage(items)
+            attempt_dates = [item.get("attempt_date") for item in items if item.get("attempt_date") is not None]
+            latest_attempt = max(attempt_dates) if attempt_dates else None
+            quiz_map[group["label"]] = {
+                "quiz_code": group["label"],
+                "label": group["label"],
+                "source_quiz_codes": group["quiz_codes"],
+                "source_label": group["source_label"],
+                "est_minutes": merged_minutes,
+                "avg_marks_possible": merged_marks,
+                "avg_percentage": merged_pct,
+                "attempt_count": 1,
+                "latest_date": latest_attempt.strftime("%d %b %Y") if latest_attempt else None,
+                "type": "merged",
+            }
+
     results = []
     for email, quiz_map in sorted(student_best.items()):
         evidence = find_best_evidence(list(quiz_map.values()), target_min, target_max, top_n)
@@ -321,17 +668,54 @@ def compute_per_student_evidence(
 
 
 def grade_suggestion(percentage: float | None) -> str:
-    """Map average percentage to GCSE grade 1-9."""
-    if percentage is None:
-        return "?"
-    thresholds = [
-        (85, "9"), (75, "8"), (65, "7"), (55, "6"),
-        (45, "5"), (35, "4"), (25, "3"), (15, "2"),
-    ]
-    for threshold, grade in thresholds:
-        if percentage >= threshold:
-            return grade
-    return "1"
+  """Map percentage to descriptive attainment bands."""
+  if percentage is None:
+    return "No grade"
+  thresholds = [
+    (85, "Very secure 9"),
+    (80, "Likely 9"),
+    (71, "Likely 8"),
+    (62, "Likely 7"),
+    (52, "Likely 6"),
+    (42, "Likely 5"),
+    (32, "Likely 4"),
+  ]
+  for threshold, label in thresholds:
+    if percentage >= threshold:
+      return label
+  return "Below likely 4"
+
+
+def grade_threshold_rows() -> list[dict]:
+  return [
+    {"threshold": "85%+", "label": "Very secure 9", "badge": "9"},
+    {"threshold": "80%+", "label": "Likely 9", "badge": "9"},
+    {"threshold": "71%+", "label": "Likely 8", "badge": "8"},
+    {"threshold": "62%+", "label": "Likely 7", "badge": "7"},
+    {"threshold": "52%+", "label": "Likely 6", "badge": "6"},
+    {"threshold": "42%+", "label": "Likely 5", "badge": "5"},
+    {"threshold": "32%+", "label": "Likely 4", "badge": "4"},
+    {"threshold": "Below 32%", "label": "Below likely 4", "badge": "1"},
+  ]
+
+
+def grade_badge_class(percentage: float | None) -> str:
+  """Return the numeric badge class used for styling grade labels."""
+  if percentage is None:
+    return "?"
+  thresholds = [
+    (85, "9"),
+    (80, "9"),
+    (71, "8"),
+    (62, "7"),
+    (52, "6"),
+    (42, "5"),
+    (32, "4"),
+  ]
+  for threshold, badge in thresholds:
+    if percentage >= threshold:
+      return badge
+  return "1"
 
 
 def find_best_evidence(quizzes_info: list, target_min: int = 50, target_max: int = 70, top_n: int = 3):
@@ -344,47 +728,55 @@ def find_best_evidence(quizzes_info: list, target_min: int = 50, target_max: int
 
     # Single quizzes
     for q in quizzes_info:
-        mins = q["est_minutes"]
-        if mins >= target_min:
-            score = _evidence_score(mins, q["avg_percentage"], target_min, target_max)
-            candidates.append({
-                "type": "single",
-                "quizzes": [q],
-                "quiz_codes": [q["quiz_code"]],
-                "total_minutes": mins,
-                "avg_percentage": q["avg_percentage"],
-                "grade": grade_suggestion(q["avg_percentage"]),
-                "score": score,
-                "label": q["quiz_code"],
-            })
+      mins = q["est_minutes"]
+      if mins >= target_min:
+        score = _evidence_score(mins, q["avg_percentage"], target_min, target_max)
+        candidates.append({
+          "type": "single",
+          "quizzes": [q],
+          "quiz_codes": [q["quiz_code"]],
+          "source_quiz_codes": q.get("source_quiz_codes") or [q["quiz_code"]],
+          "total_minutes": mins,
+          "avg_percentage": q["avg_percentage"],
+          "grade": grade_suggestion(q["avg_percentage"]),
+          "grade_class": grade_badge_class(q["avg_percentage"]),
+          "score": score,
+          "label": q.get("label") or q["quiz_code"],
+        })
 
     # Pairs of quizzes
     for i in range(len(quizzes_info)):
-        for j in range(i + 1, len(quizzes_info)):
-            q1, q2 = quizzes_info[i], quizzes_info[j]
-            total_mins = q1["est_minutes"] + q2["est_minutes"]
-            if total_mins >= target_min:
-                # Weighted average percentage
-                w1 = q1["avg_marks_possible"]
-                w2 = q2["avg_marks_possible"]
-                total_w = w1 + w2
-                if total_w > 0 and q1["avg_percentage"] is not None and q2["avg_percentage"] is not None:
-                    combined_pct = (q1["avg_percentage"] * w1 + q2["avg_percentage"] * w2) / total_w
-                else:
-                    combined_pct = q1["avg_percentage"] or q2["avg_percentage"]
-                score = _evidence_score(total_mins, combined_pct, target_min, target_max)
-                candidates.append({
-                    "type": "combined",
-                    "quizzes": [q1, q2],
-                    "quiz_codes": [q1["quiz_code"], q2["quiz_code"]],
-                    "total_minutes": total_mins,
-                    "avg_percentage": combined_pct,
-                    "grade": grade_suggestion(combined_pct),
-                    "score": score,
-                    "label": f"{q1['quiz_code']} + {q2['quiz_code']}",
-                })
+      for j in range(i + 1, len(quizzes_info)):
+        q1, q2 = quizzes_info[i], quizzes_info[j]
+        q1_sources = set(q1.get("source_quiz_codes") or [q1["quiz_code"]])
+        q2_sources = set(q2.get("source_quiz_codes") or [q2["quiz_code"]])
+        if q1_sources & q2_sources:
+          continue
 
-    # Sort by score descending, take top_n
+        total_mins = q1["est_minutes"] + q2["est_minutes"]
+        if total_mins >= target_min:
+          w1 = q1["avg_marks_possible"]
+          w2 = q2["avg_marks_possible"]
+          total_w = w1 + w2
+          if total_w > 0 and q1["avg_percentage"] is not None and q2["avg_percentage"] is not None:
+            combined_pct = (q1["avg_percentage"] * w1 + q2["avg_percentage"] * w2) / total_w
+          else:
+            combined_pct = q1["avg_percentage"] or q2["avg_percentage"]
+
+          score = _evidence_score(total_mins, combined_pct, target_min, target_max)
+          candidates.append({
+            "type": "combined",
+            "quizzes": [q1, q2],
+            "quiz_codes": [q1["quiz_code"], q2["quiz_code"]],
+            "source_quiz_codes": sorted(q1_sources | q2_sources),
+            "total_minutes": total_mins,
+            "avg_percentage": combined_pct,
+            "grade": grade_suggestion(combined_pct),
+            "grade_class": grade_badge_class(combined_pct),
+            "score": score,
+            "label": f"{q1['quiz_code']} + {q2['quiz_code']}",
+          })
+
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]
 
@@ -533,6 +925,23 @@ BASE_STYLE = """
   .grade-2 { background: #ea580c; color: #fff; }
   .grade-1 { background: #dc2626; color: #fff; }
   .grade-? { background: #9ca3af; color: #fff; }
+
+  .student-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: .8rem; max-height: 420px; overflow-y: auto; padding: .2rem; }
+  .student-option { display: block; border: 1px solid #dbe3f0; border-radius: 10px; background: #f8fbff; padding: .85rem; cursor: pointer; }
+  .student-option:hover { border-color: #93c5fd; background: #f0f7ff; }
+  .student-option input { margin-right: .45rem; }
+  .student-name { font-weight: 700; color: #0f3460; }
+  .student-meta { display: block; color: #64748b; font-size: .8rem; margin-top: .2rem; }
+  .student-tags { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
+  .score-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .2rem .55rem; border-radius: 999px; font-size: .75rem; font-weight: 600; }
+  .score-chip-existing { background: #eef2ff; color: #3730a3; }
+  .score-chip-live { background: #ecfdf5; color: #065f46; }
+  .score-chip-merge { background: #fff7ed; color: #9a3412; }
+  .score-cell { min-width: 150px; }
+  .score-main { font-size: 1rem; font-weight: 800; color: #0f3460; }
+  .score-sub { color: #64748b; font-size: .8rem; margin-top: .2rem; }
+  .soft-btn { background: #e2e8f0; color: #0f172a; }
+  .soft-btn:hover { background: #cbd5e1; }
 </style>
 """
 
@@ -542,6 +951,7 @@ INDEX_TEMPLATE = BASE_STYLE + """
 <nav class="tabs">
   <a class="tab active" href="/">Grades</a>
   <a class="tab" href="/evidence{% if class_code %}?class_code={{ class_code }}{% endif %}">Best Evidence</a>
+  <a class="tab" href="/evidence/planner">Evidence Planner</a>
 </nav>
 
 <div class="card">
@@ -592,7 +1002,15 @@ INDEX_TEMPLATE = BASE_STYLE + """
         <div class="section-title">Include in PDF</div>
         <div class="checkbox-row">
           <input type="checkbox" name="inc_marks" id="inc_marks" value="1" checked>
-          <label for="inc_marks">Marks</label>
+          <label for="inc_marks">Total marks</label>
+        </div>
+        <div class="checkbox-row" style="margin-top:.4rem">
+          <input type="checkbox" name="inc_percentage" id="inc_percentage" value="1" checked>
+          <label for="inc_percentage">Percentage</label>
+        </div>
+        <div class="checkbox-row" style="margin-top:.4rem">
+          <input type="checkbox" name="inc_question_marks" id="inc_question_marks" value="1" checked>
+          <label for="inc_question_marks">Question max marks below question</label>
         </div>
         <div class="checkbox-row" style="margin-top:.4rem">
           <input type="checkbox" name="inc_comments" id="inc_comments" value="1" checked>
@@ -609,7 +1027,11 @@ INDEX_TEMPLATE = BASE_STYLE + """
       </div>
 
       <div>
-        <div class="section-title">Page margins (mm)</div>
+        <div class="section-title">Header</div>
+        <label>Centre number
+          <input type="text" name="centre_number" value="" placeholder="optional override">
+        </label>
+        <div class="section-title" style="margin-top:1rem">Page margins (mm)</div>
         <label>Top / Bottom
           <input type="number" name="margin_tb" value="15" min="5" max="50">
         </label>
@@ -699,7 +1121,15 @@ PDF_OPTIONS_PARTIAL = """
     <div class="section-title">Include in PDF</div>
     <div class="checkbox-row">
       <input type="checkbox" name="inc_marks" id="pdf_inc_marks_{uid}" value="1" checked>
-      <label for="pdf_inc_marks_{uid}">Marks</label>
+      <label for="pdf_inc_marks_{uid}">Total marks</label>
+    </div>
+    <div class="checkbox-row" style="margin-top:.4rem">
+      <input type="checkbox" name="inc_percentage" id="pdf_inc_percentage_{uid}" value="1" checked>
+      <label for="pdf_inc_percentage_{uid}">Percentage</label>
+    </div>
+    <div class="checkbox-row" style="margin-top:.4rem">
+      <input type="checkbox" name="inc_question_marks" id="pdf_inc_question_marks_{uid}" value="1" checked>
+      <label for="pdf_inc_question_marks_{uid}">Question max marks below question</label>
     </div>
     <div class="checkbox-row" style="margin-top:.4rem">
       <input type="checkbox" name="inc_comments" id="pdf_inc_comments_{uid}" value="1" checked>
@@ -715,7 +1145,11 @@ PDF_OPTIONS_PARTIAL = """
     </div>
   </div>
   <div>
-    <div class="section-title">Page margins (mm)</div>
+    <div class="section-title">Header</div>
+    <label>Centre number
+      <input type="text" name="centre_number" value="" placeholder="optional override">
+    </label>
+    <div class="section-title" style="margin-top:1rem">Page margins (mm)</div>
     <label>Top / Bottom <input type="number" name="margin_tb" value="15" min="5" max="50"></label>
     <label style="margin-top:.5rem">Left / Right <input type="number" name="margin_lr" value="15" min="5" max="50"></label>
   </div>
@@ -748,6 +1182,7 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
 <nav class="tabs">
   <a class="tab" href="/">Grades</a>
   <a class="tab active" href="/evidence{% if class_code %}?class_code={{ class_code }}{% endif %}">Best Evidence</a>
+  <a class="tab" href="/evidence/planner">Evidence Planner</a>
 </nav>
 
 <div class="card">
@@ -786,6 +1221,9 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
     <label>Spec code filter <span style="font-weight:400;color:#888">(optional)</span>
       <input type="text" name="spec_code" value="{{ spec_code }}" placeholder="e.g. 3.1.2 or Networks">
     </label>
+    <label>Merged quiz pairs <span style="font-weight:400;color:#888">(optional — e.g. Q1+Q2; Q3+Q4)</span>
+      <input type="text" name="merge_groups" value="{{ merge_groups_raw }}" placeholder="Q1+Q2; Q3+Q4" style="width:320px">
+    </label>
     <button type="submit" class="btn">Find Evidence</button>
   </form>
 </div>
@@ -812,8 +1250,11 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
         {% endif %}
         {% if ev.type == "combined" %}<span class="ev-pill" style="background:#fef9c3;color:#713f12">Combined</span>{% endif %}
       </div>
+      {% if ev.quizzes|length == 1 and ev.quizzes[0].source_quiz_codes|length > 1 %}
+      <div class="info" style="margin-bottom:.8rem">Built from {{ ev.quizzes[0].source_label }}</div>
+      {% endif %}
       <div class="ev-grade">
-        Grade <span class="grade-badge grade-{{ ev.grade }}">{{ ev.grade }}</span>
+        <span class="grade-badge grade-{{ ev.grade_class }}">{{ ev.grade }}</span>
         <small>suggested</small>
       </div>
 
@@ -823,29 +1264,26 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
         ~{{ q.est_minutes }} min
         {% if q.avg_percentage is not none %} · {{ "%.1f"|format(q.avg_percentage) }}%{% endif %}
         · {{ q.attempt_count }} attempt{{ 's' if q.attempt_count != 1 else '' }}
+        {% if q.source_quiz_codes|length > 1 %} · {{ q.source_label }}{% endif %}
       </div>
       {% endfor %}
 
       <div class="ev-actions">
-        {% if ev.type == "single" %}
-        <form method="get" action="/evidence/pdf" style="display:inline">
+        <form method="get" action="{% if ev.source_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" style="display:block">
           <input type="hidden" name="class_code" value="{{ class_code }}">
-          <input type="hidden" name="quiz_code" value="{{ ev.quiz_codes[0] }}">
+          {% if ev.source_quiz_codes|length > 1 %}
+          <input type="hidden" name="quiz_codes" value="{{ ev.source_quiz_codes|join(',') }}">
+          <input type="hidden" name="merged_name" value="{{ ev.quizzes[0].quiz_code if ev.quizzes|length == 1 else ev.label }}">
+          {% else %}
+          <input type="hidden" name="quiz_code" value="{{ ev.source_quiz_codes[0] }}">
+          {% endif %}
           {% if student_email %}<input type="hidden" name="student_email" value="{{ student_email }}">{% endif %}
-          {{ pdf_options_html|safe }}
-          <button type="submit" class="btn btn-green btn-sm" style="margin-top:.5rem">⬇ Download PDF</button>
+          <details style="margin-top:.5rem">
+            <summary style="cursor:pointer;color:#0f3460;font-size:.85rem">PDF options</summary>
+            {{ render_pdf_options('ev_' ~ rank)|safe }}
+          </details>
+          <button type="submit" class="btn btn-green btn-sm" style="margin-top:.5rem">⬇ {% if ev.source_quiz_codes|length > 1 %}Merged PDF{% else %}PDF{% endif %}</button>
         </form>
-        {% else %}
-        {% for qc in ev.quiz_codes %}
-        <form method="get" action="/evidence/pdf" style="display:inline">
-          <input type="hidden" name="class_code" value="{{ class_code }}">
-          <input type="hidden" name="quiz_code" value="{{ qc }}">
-          {% if student_email %}<input type="hidden" name="student_email" value="{{ student_email }}">{% endif %}
-          {{ pdf_options_html|safe }}
-          <button type="submit" class="btn btn-green btn-sm" style="margin-top:.5rem">⬇ {{ qc }}</button>
-        </form>
-        {% endfor %}
-        {% endif %}
       </div>
     </div>
     {% endfor %}
@@ -869,7 +1307,12 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
     <tbody>
       {% for q in all_quizzes %}
       <tr>
-        <td>{{ q.quiz_code }}</td>
+        <td>
+          {{ q.quiz_code }}
+          {% if q.source_quiz_codes|length > 1 %}
+          <br><small style="color:#64748b">{{ q.source_label }}</small>
+          {% endif %}
+        </td>
         <td>~{{ q.est_minutes }}</td>
         <td>
           {% if q.avg_percentage is not none %}
@@ -877,16 +1320,24 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
           {{ "%.1f"|format(q.avg_percentage) }}%
           {% else %}—{% endif %}
         </td>
-        <td><span class="grade-badge grade-{{ grade_of(q.avg_percentage) }}">{{ grade_of(q.avg_percentage) }}</span></td>
+        <td><span class="grade-badge grade-{{ grade_class_of(q.avg_percentage) }}">{{ grade_of(q.avg_percentage) }}</span></td>
         <td>{{ q.attempt_count }}</td>
         <td>{{ q.latest_date or "—" }}</td>
         <td>
-          <form method="get" action="/evidence/pdf" style="display:inline">
+          <form method="get" action="{% if q.source_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" style="display:inline-block;min-width:180px">
             <input type="hidden" name="class_code" value="{{ class_code }}">
+            {% if q.source_quiz_codes|length > 1 %}
+            <input type="hidden" name="quiz_codes" value="{{ q.source_quiz_codes|join(',') }}">
+            <input type="hidden" name="merged_name" value="{{ q.quiz_code }}">
+            {% else %}
             <input type="hidden" name="quiz_code" value="{{ q.quiz_code }}">
+            {% endif %}
             {% if student_email %}<input type="hidden" name="student_email" value="{{ student_email }}">{% endif %}
-            {{ pdf_options_html|safe }}
-            <button type="submit" class="btn btn-sm btn-green">⬇ PDF</button>
+            <details>
+              <summary style="cursor:pointer;color:#0f3460;font-size:.8rem">PDF options</summary>
+              {{ render_pdf_options('all_' ~ loop.index0)|safe }}
+            </details>
+            <button type="submit" class="btn btn-sm btn-green" style="margin-top:.35rem">⬇ {% if q.source_quiz_codes|length > 1 %}Merged PDF{% else %}PDF{% endif %}</button>
           </form>
         </td>
       </tr>
@@ -894,6 +1345,74 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
     </tbody>
   </table>
 </div>
+
+{% if merged_assessments %}
+<div class="card">
+  <h2>Merged Assessments
+    <span class="time-badge">{{ merged_assessments|length }} merge{{ 's' if merged_assessments|length != 1 else '' }}</span>
+  </h2>
+  {% for merged in merged_assessments %}
+  <div style="border:1px solid #dbe3f0;border-radius:10px;padding:1rem;margin-top:1rem;background:#f8fbff">
+    <div class="meta" style="margin-bottom:1rem">
+      <div class="meta-item"><span>Name</span><span>{{ merged.quiz_code }}</span></div>
+      <div class="meta-item"><span>Source quizzes</span><span>{{ merged.source_label }}</span></div>
+      <div class="meta-item"><span>Est. time</span><span>~{{ merged.est_minutes }} min</span></div>
+      <div class="meta-item"><span>Attempted both</span><span>{{ merged.attempt_count }}</span></div>
+      <div class="meta-item"><span>Avg %</span><span>{% if merged.avg_percentage is not none %}{{ "%.1f"|format(merged.avg_percentage) }}%{% else %}—{% endif %}</span></div>
+    </div>
+
+    <form method="get" action="/evidence/pdf/merged" style="margin-bottom:1rem">
+      <input type="hidden" name="class_code" value="{{ class_code }}">
+      <input type="hidden" name="quiz_codes" value="{{ merged.source_quiz_codes|join(',') }}">
+      <input type="hidden" name="merged_name" value="{{ merged.quiz_code }}">
+      {% if student_email %}<input type="hidden" name="student_email" value="{{ student_email }}">{% endif %}
+      <details>
+        <summary style="cursor:pointer;color:#0f3460;font-size:.85rem">PDF options</summary>
+        {{ render_pdf_options('merged_' ~ loop.index0)|safe }}
+      </details>
+      <button type="submit" class="btn btn-green btn-sm" style="margin-top:.5rem">⬇ Download merged PDF</button>
+    </form>
+
+    {% if merged.student_rows %}
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Cand #</th>
+            <th>Student</th>
+            <th>Email</th>
+            <th>{{ merged.quiz_code }}</th>
+            {% for qc in merged.source_quiz_codes %}<th>{{ qc }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in merged.student_rows %}
+          <tr>
+            <td>{{ row.candidate_no or "—" }}</td>
+            <td>{{ row.full_name or row.email }}</td>
+            <td>{{ row.email }}</td>
+            <td>
+              {% if row.percentage is not none %}
+              <div class="bar-wrap"><div class="bar-fill" style="width:{{ [row.percentage,100]|min }}%"></div></div>
+              {{ "%.1f"|format(row.percentage) }}%
+              {% else %}—{% endif %}
+            </td>
+            {% for qc in merged.source_quiz_codes %}
+            {% set component_pct = row.component_percentages.get(qc) %}
+            <td>{% if component_pct is not none %}{{ "%.1f"|format(component_pct) }}%{% else %}—{% endif %}</td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="no-data">No students have attempted every quiz in this merged assessment yet.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 
 {% if student_evidence %}
 <div class="card">
@@ -913,6 +1432,7 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
     </thead>
     <tbody>
       {% for s in student_evidence %}
+      {% set student_index = loop.index0 %}
       <tr>
         <td style="white-space:nowrap">{{ s.candidate_no or "—" }}</td>
         <td style="white-space:nowrap">
@@ -924,17 +1444,29 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
           {% set ev = s.evidence[i] %}
           <td style="min-width:200px;vertical-align:top">
             <div style="font-weight:700;font-size:.85rem;color:#0f3460;margin-bottom:.2rem">{{ ev.label }}</div>
+            {% if ev.quizzes[0].source_quiz_codes|length > 1 %}
+            <div style="font-size:.75rem;color:#64748b;margin-bottom:.3rem">{{ ev.quizzes[0].source_label }}</div>
+            {% endif %}
             <div style="font-size:.8rem;color:#555;margin-bottom:.3rem">
               ~{{ ev.total_minutes }} min
               {% if ev.avg_percentage is not none %} &middot; {{ "%.0f"|format(ev.avg_percentage) }}%{% endif %}
             </div>
-            <span class="grade-badge grade-{{ ev.grade }}" style="font-size:.8rem;margin-bottom:.4rem;display:inline-block">Grade {{ ev.grade }}</span>
-            <div style="margin-top:.35rem;display:flex;flex-wrap:wrap;gap:.3rem">
-              {% for qc in ev.quiz_codes %}
-              <a href="/evidence/pdf?class_code={{ class_code }}&quiz_code={{ qc }}&student_email={{ s.email }}&inc_marks=1&inc_comments=1&inc_questions=1&inc_labels=1&margin_tb=15&margin_lr=15&img_pct=100&img_crop_pct=3&page_break=1"
-                 class="btn btn-green btn-sm">⬇ {{ qc }}</a>
-              {% endfor %}
-            </div>
+            <span class="grade-badge grade-{{ ev.grade_class }}" style="font-size:.8rem;margin-bottom:.4rem;display:inline-block">{{ ev.grade }}</span>
+            <form method="get" action="{% if ev.source_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" style="margin-top:.35rem">
+              <input type="hidden" name="class_code" value="{{ class_code }}">
+              {% if ev.source_quiz_codes|length > 1 %}
+              <input type="hidden" name="quiz_codes" value="{{ ev.source_quiz_codes|join(',') }}">
+              <input type="hidden" name="merged_name" value="{{ ev.quizzes[0].quiz_code if ev.quizzes|length == 1 else ev.label }}">
+              {% else %}
+              <input type="hidden" name="quiz_code" value="{{ ev.source_quiz_codes[0] }}">
+              {% endif %}
+              <input type="hidden" name="student_email" value="{{ s.email }}">
+              <details>
+                <summary style="cursor:pointer;color:#0f3460;font-size:.8rem">PDF options</summary>
+                {{ render_pdf_options('student_' ~ student_index ~ '_' ~ i)|safe }}
+              </details>
+              <button type="submit" class="btn btn-green btn-sm" style="margin-top:.35rem">⬇ {% if ev.source_quiz_codes|length > 1 %}Merged PDF{% else %}PDF{% endif %}</button>
+            </form>
           </td>
           {% else %}
           <td style="color:#ccc;text-align:center;vertical-align:middle">—</td>
@@ -948,6 +1480,139 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
 </div>
 {% endif %}
 
+{% endif %}
+"""
+
+PLANNER_TEMPLATE = BASE_STYLE + """
+<h1>Grade Viewer</h1>
+
+<nav class="tabs">
+  <a class="tab" href="/">Grades</a>
+  <a class="tab" href="/evidence">Best Evidence</a>
+  <a class="tab active" href="/evidence/planner">Evidence Planner</a>
+</nav>
+
+<div class="card">
+  <h2>Evidence Planner</h2>
+  <p class="info" style="margin-bottom:1rem">
+    This page uses the existing evidence file <strong>y11scores.csv</strong>. Tick the students you want,
+    enter quiz codes separated by commas, and optionally define merge groups using
+    <strong>semicolon-separated groups</strong> such as <strong>Q1+Q2; Q3+Q4</strong>.
+  </p>
+  <div style="display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:1rem">
+    {% for band in grade_thresholds %}
+    <span class="score-chip" style="background:#f8fafc;color:#0f172a;border:1px solid #dbe3f0">
+      <span class="grade-badge grade-{{ band.badge }}" style="margin-left:0">{{ band.label }}</span>
+      <span>{{ band.threshold }}</span>
+    </span>
+    {% endfor %}
+  </div>
+  <form method="get" action="/evidence/planner">
+    <label>Class Code
+      <input type="text" name="class_code" value="{{ class_code }}" placeholder="e.g. oxaqa25" required>
+    </label>
+    <label>Quiz Codes
+      <input type="text" name="quiz_codes" value="{{ quiz_codes_raw }}" placeholder="Q1, Q2, Q3" style="width:320px" required>
+    </label>
+    <label>Merged Quiz Groups
+      <input type="text" name="merge_groups" value="{{ merge_groups_raw }}" placeholder="Q1+Q2; Q3+Q4" style="width:320px">
+    </label>
+    <button type="submit" class="btn">Show Scores</button>
+    <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = true)">Select All</button>
+    <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = false)">Clear All</button>
+
+    <div style="width:100%;margin-top:.8rem">
+      <div class="section-title">Students</div>
+      <div class="student-picker">
+        {% for student in students %}
+        <label class="student-option">
+          <div>
+            <input type="checkbox" name="selected_candidate" value="{{ student.candidate_no }}" {% if student.selected %}checked{% endif %}>
+            <span class="student-name">{{ student.display_name }}</span>
+          </div>
+          <span class="student-meta">#{{ student.candidate_no }} · {{ student.evidence_count }} existing evidence piece{{ 's' if student.evidence_count != 1 else '' }}</span>
+          {% if student.email %}<span class="student-meta">{{ student.email }}</span>{% endif %}
+          <div class="student-tags">
+            {% for item in student.existing_items %}
+            <span class="score-chip score-chip-existing">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</span>
+            {% endfor %}
+          </div>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+  </form>
+</div>
+
+{% if error %}<div class="card error">{{ error }}</div>{% endif %}
+
+{% if selected_results %}
+<div class="card">
+  <div class="meta">
+    <div class="meta-item"><span>Selected Students</span><span>{{ selected_results|length }}</span></div>
+    <div class="meta-item"><span>Quizzes</span><span>{{ quiz_codes|length }}</span></div>
+    <div class="meta-item"><span>Merged Groups</span><span>{{ merge_groups|length }}</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <div style="overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Candidate #</th>
+          <th>Student</th>
+          <th>Existing Evidence</th>
+          {% for quiz_code in quiz_codes %}<th>{{ quiz_code }}</th>{% endfor %}
+          {% for group in merge_groups %}<th>{{ group.label }}</th>{% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in selected_results %}
+        <tr>
+          <td>{{ row.candidate_no }}</td>
+          <td style="white-space:nowrap">
+            {{ row.display_name }}
+            {% if row.email %}<br><small style="color:#64748b">{{ row.email }}</small>{% endif %}
+          </td>
+          <td class="score-cell">
+            {% for item in row.existing_items %}
+            <div class="score-chip score-chip-existing" style="margin-bottom:.35rem">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</div>
+            {% endfor %}
+            {% if not row.existing_items %}<span class="no-data">No existing evidence</span>{% endif %}
+          </td>
+          {% for cell in row.quiz_scores %}
+          <td class="score-cell">
+            {% if cell.percentage is not none %}
+            <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
+            <div class="score-sub">~{{ cell.minutes }} min · {{ grade_of(cell.percentage) }}</div>
+            {% else %}
+            <span class="no-data">—</span>
+            {% endif %}
+          </td>
+          {% endfor %}
+          {% for cell in row.merged_scores %}
+          <td class="score-cell">
+            {% if cell.percentage is not none %}
+            <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
+            <div class="score-sub">~{{ cell.total_minutes }} min · {{ grade_of(cell.percentage) }}</div>
+            {% if cell.total_questions %}
+            <div class="score-sub">Attempted {{ cell.attempted_questions }}/{{ cell.total_questions }} questions ({{ "%.0f"|format((cell.attempted_questions / cell.total_questions) * 100) }}%)</div>
+            {% endif %}
+            <div class="score-chip score-chip-merge" style="margin-top:.35rem">{{ '1 hr+' if cell.total_minutes >= 60 else 'Under 1 hr' }}</div>
+            {% elif cell.missing %}
+            <div class="score-sub">Missing: {{ cell.missing|join(', ') }}</div>
+            {% else %}
+            <span class="no-data">—</span>
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 {% endif %}
 """
 
@@ -969,42 +1634,297 @@ def _download_image(url: str) -> io.BytesIO | None:
 
 
 def _is_image_only_response(answer) -> bool:
-    """
-    Detect if the student response is image-only:
-    - answer is a string URL/data-url pointing to an image, OR
-    - answer is a dict with an image key but no text, OR
-    - answer text equals the question text (image-copied response)
-    """
-    if answer is None:
-        return False
-    if isinstance(answer, str):
-        low = answer.lower().strip()
-        return low.startswith("http") and any(
-            ext in low for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", "/image", "image/")
-        )
-    if isinstance(answer, dict):
-        has_image = bool(answer.get("image_url") or answer.get("image"))
-        has_text  = bool(str(answer.get("text", "")).strip())
-        return has_image and not has_text
+  """
+  Detect if the student response is image-only:
+  - answer is a string URL/data-url pointing to an image, OR
+  - answer is a dict with an image key but no text.
+  """
+  if answer is None:
     return False
+  if isinstance(answer, str):
+    low = answer.lower().strip()
+    return (low.startswith("http") or low.startswith("data:image/")) and any(
+      ext in low for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", "/image", "image/")
+    )
+  if isinstance(answer, dict):
+    has_image = bool(answer.get("image_url") or answer.get("image"))
+    has_text = bool(str(answer.get("text", "")).strip())
+    return has_image and not has_text
+  return False
 
 
 def _answer_image_url(answer) -> str | None:
-    if isinstance(answer, str) and answer.lower().startswith("http"):
-        return answer
-    if isinstance(answer, dict):
-        return answer.get("image_url") or answer.get("image")
-    return None
+  if isinstance(answer, str):
+    low = answer.lower().strip()
+    if (low.startswith("http") or low.startswith("data:image/")) and any(
+      ext in low for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", "/image", "image/")
+    ):
+      return answer
+  if isinstance(answer, dict):
+    return answer.get("image_url") or answer.get("image")
+  return None
 
 
 def _answer_text(answer) -> str:
-    if answer is None:
-        return ""
-    if isinstance(answer, str):
-        return answer
-    if isinstance(answer, dict):
-        return answer.get("text", "") or ""
-    return str(answer)
+  if answer is None:
+    return ""
+  if isinstance(answer, str):
+    return answer
+  if isinstance(answer, dict):
+    return answer.get("text", "") or ""
+  return str(answer)
+
+
+def _extract_image_src(value: str) -> str | None:
+  if not value:
+    return None
+  match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', value, re.IGNORECASE)
+  if match:
+    return match.group(1).strip()
+  return None
+
+
+def _strip_image_tags(value: str) -> str:
+  if not value:
+    return ""
+  return re.sub(r'<img[^>]*>', '', value, flags=re.IGNORECASE).strip()
+
+
+def _format_question_max_marks(value) -> str | None:
+  if value is None:
+    return None
+  try:
+    numeric = float(value)
+  except (TypeError, ValueError):
+    return None
+  if numeric.is_integer():
+    numeric = int(numeric)
+  suffix = "mark" if numeric == 1 else "marks"
+  return f"[{numeric} {suffix}]"
+
+
+def _normalise_attempt_questions(attempt: dict) -> dict:
+  if attempt.get("questions"):
+    return attempt
+  for alt in ("question_list", "responses", "answers", "items", "quiz_responses"):
+    if attempt.get(alt):
+      return {**attempt, "questions": attempt[alt]}
+  return attempt
+
+
+def _build_candidate_map(emails: list[str]) -> dict:
+  db = get_db()
+  candidate_map = {}
+  for email in {email.lower() for email in emails if email}:
+    row = db.execute("SELECT * FROM candidates WHERE email=?", (email,)).fetchone()
+    if row:
+      candidate_map[email] = dict(row)
+  return candidate_map
+
+
+def _should_replace_attempt(previous: dict | None, current: dict) -> bool:
+  if previous is None:
+    return True
+
+  previous_pct = attempt_percentage(previous)
+  current_pct = attempt_percentage(current)
+  if current_pct is not None and previous_pct is None:
+    return True
+  if current_pct is not None and previous_pct is not None and current_pct > previous_pct:
+    return True
+  if current_pct == previous_pct:
+    previous_date = _attempt_date(previous)
+    current_date = _attempt_date(current)
+    return current_date is not None and (previous_date is None or current_date > previous_date)
+  return False
+
+
+def build_student_best_attempt_map(raw_by_quiz: dict) -> dict:
+  best_attempts = {}
+  for quiz_code, attempts in raw_by_quiz.items():
+    for raw_attempt in attempts:
+      attempt = _normalise_attempt_questions(raw_attempt)
+      email = (attempt.get("student_email") or "").strip().lower()
+      if not email:
+        continue
+      previous = best_attempts.setdefault(email, {}).get(quiz_code)
+      if _should_replace_attempt(previous, attempt):
+        best_attempts[email][quiz_code] = {**attempt, "quiz_code": quiz_code}
+  return best_attempts
+
+
+def _build_pdf_image(
+  url: str,
+  *,
+  max_width: float,
+  max_height: float,
+  img_pct: float,
+  crop_top_pct: float = 0.0,
+) -> RLImage | None:
+  img_buf = _download_image(url)
+  if not img_buf:
+    return None
+
+  try:
+    with PILImage.open(img_buf) as pil:
+      image = PILImageOps.exif_transpose(pil)
+      if crop_top_pct > 0:
+        crop_pixels = int(image.height * (crop_top_pct / 100.0))
+        if 0 < crop_pixels < image.height:
+          image = image.crop((0, crop_pixels, image.width, image.height))
+
+      width, height = image.size
+      if not width or not height:
+        return None
+
+      target_width = min(max_width * max(img_pct, 1) / 100.0, max_width)
+      scale = min(target_width / width, max_height / height, 1.0)
+      output = io.BytesIO()
+      image.save(output, format="PNG")
+      output.seek(0)
+      return RLImage(output, width=width * scale, height=height * scale)
+  except Exception:
+    return None
+
+
+def _pdf_request_options(args) -> dict:
+  def arg_bool(name: str) -> bool:
+    return args.get(name) in {"1", "true", "True", "on", "yes"}
+
+  def arg_float(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+      value = float(args.get(name, default))
+    except (TypeError, ValueError):
+      value = default
+    if minimum is not None:
+      value = max(minimum, value)
+    if maximum is not None:
+      value = min(maximum, value)
+    return value
+
+  return {
+    "inc_marks": arg_bool("inc_marks"),
+    "inc_percentage": arg_bool("inc_percentage"),
+    "inc_question_marks": arg_bool("inc_question_marks"),
+    "inc_comments": arg_bool("inc_comments"),
+    "inc_questions": arg_bool("inc_questions"),
+    "inc_labels": arg_bool("inc_labels"),
+    "centre_number": (args.get("centre_number", "") or "").strip(),
+    "margin_tb": arg_float("margin_tb", 15, 5, 50),
+    "margin_lr": arg_float("margin_lr", 15, 5, 50),
+    "img_pct": arg_float("img_pct", 100, 30, 150),
+    "img_crop_pct": arg_float("img_crop_pct", 3, 0, 25),
+    "page_break_between": args.get("page_break", "1") == "1",
+  }
+
+
+def render_pdf_options(uid: str) -> str:
+  return PDF_OPTIONS_PARTIAL.replace("{uid}", uid)
+
+
+def _pdf_text(value) -> str:
+  if value is None:
+    return ""
+  return html.escape(str(value), quote=False)
+
+
+def _question_answer_parts(question: dict) -> tuple[str, str, bool]:
+  answer_payload = (
+    question.get("answer")
+    or question.get("response")
+    or question.get("student_answer")
+    or question.get("student_response")
+    or question.get("answer_data")
+  )
+  answer_image = question.get("answer_image_url") or _answer_image_url(answer_payload) or ""
+  answer_text = question.get("answer_text")
+  if answer_text is None:
+    answer_text = _answer_text(answer_payload)
+  answer_text = answer_text or ""
+  if not answer_image:
+    answer_image = _extract_image_src(answer_text) or ""
+  answer_text = _strip_image_tags(answer_text)
+  if not answer_image:
+    answer_image = _answer_image_url(answer_text) or ""
+  if answer_image and answer_text.strip() == answer_image:
+    answer_text = ""
+  has_image = bool(question.get("has_image", False) or answer_image or _is_image_only_response(answer_payload))
+  is_image_answer = bool(answer_image) or (has_image and not answer_text.strip())
+  return answer_text, answer_image, is_image_answer
+
+
+def _question_prompt_parts(question: dict) -> tuple[str, str]:
+  question_text = question.get("question") or ""
+  question_image = question.get("question_image_url") or ""
+  if not question_image:
+    question_image = _extract_image_src(question_text) or ""
+  question_text = _strip_image_tags(question_text)
+  if not question_image:
+    question_image = _answer_image_url(question_text) or ""
+  if question_image and question_text.strip() == question_image:
+    question_text = ""
+  return question_text, question_image
+
+
+def _question_attempt_progress(attempt: dict) -> tuple[int | None, int | None]:
+  questions = (
+    attempt.get("questions")
+    or attempt.get("question_list")
+    or attempt.get("responses")
+    or attempt.get("answers")
+    or attempt.get("items")
+    or attempt.get("quiz_responses")
+    or []
+  )
+  if not questions:
+    return None, None
+
+  attempted = 0
+  total = 0
+  for question in questions:
+    if not isinstance(question, dict):
+      continue
+    total += 1
+    answer_text, answer_image, is_image_answer = _question_answer_parts(question)
+    if answer_text.strip() or answer_image or is_image_answer:
+      attempted += 1
+
+  return attempted, total
+
+
+def build_merged_pdf_attempts(best_attempts: dict, quiz_codes: list[str], student_email: str = "") -> tuple[list, list[str]]:
+  if student_email:
+    candidate_pairs = [(student_email, best_attempts.get(student_email, {}))]
+  else:
+    candidate_pairs = sorted(best_attempts.items())
+
+  eligible_attempts = []
+  eligible_emails = []
+  for email, score_map in candidate_pairs:
+    if not score_map or not all(score_map.get(quiz_code) for quiz_code in quiz_codes):
+      continue
+
+    component_attempts = [_normalise_attempt_questions(score_map[quiz_code]) for quiz_code in quiz_codes]
+    total_possible = sum((attempt.get("marks_possible") or 0) for attempt in component_attempts)
+    total_awarded_values = [attempt.get("marks_awarded") for attempt in component_attempts if attempt.get("marks_awarded") is not None]
+    merged_questions = []
+    for attempt in component_attempts:
+      merged_questions.extend(attempt.get("questions") or [])
+
+    merged_attempt = dict(component_attempts[0])
+    merged_attempt.update({
+      "student_email": email,
+      "marks_awarded": sum(total_awarded_values) if total_awarded_values else None,
+      "marks_possible": total_possible or None,
+      "percentage": _merged_percentage(component_attempts),
+      "questions": merged_questions,
+      "_quiz_length_minutes": round(total_possible) if total_possible else None,
+      "_display_quiz_code": "",
+    })
+    eligible_attempts.append(merged_attempt)
+    eligible_emails.append(email)
+
+  return eligible_attempts, eligible_emails
 
 
 def generate_pdf(
@@ -1014,192 +1934,173 @@ def generate_pdf(
     candidate_map: dict,
     *,
     inc_marks: bool = True,
+  inc_percentage: bool = True,
+  inc_question_marks: bool = True,
     inc_comments: bool = True,
     inc_questions: bool = True,
     inc_labels: bool = True,
+  centre_number: str = "",
     margin_tb: float = 15,
     margin_lr: float = 15,
     img_pct: float = 100,
     img_crop_pct: float = 3.0,
     page_break_between: bool = True,
+    document_label: str | None = None,
 ) -> io.BytesIO:
     buf = io.BytesIO()
 
     page_w, page_h = A4
     usable_w = page_w - 2 * margin_lr * mm
+    usable_h = page_h - 2 * margin_tb * mm
+    question_img_h = usable_h * 0.38
+    response_img_h = usable_h * 0.46
 
     doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        topMargin=margin_tb * mm,
-        bottomMargin=margin_tb * mm,
-        leftMargin=margin_lr * mm,
-        rightMargin=margin_lr * mm,
+      buf,
+      pagesize=A4,
+      topMargin=margin_tb * mm,
+      bottomMargin=margin_tb * mm,
+      leftMargin=margin_lr * mm,
+      rightMargin=margin_lr * mm,
     )
 
-    styles = getSampleStyleSheet()
-    style_h1    = ParagraphStyle("H1",    fontSize=14, fontName="Helvetica-Bold",   spaceAfter=4,  textColor=colors.HexColor("#0f3460"))
-    style_h2    = ParagraphStyle("H2",    fontSize=11, fontName="Helvetica-Bold",   spaceAfter=3,  textColor=colors.HexColor("#16213e"))
-    style_h3    = ParagraphStyle("H3",    fontSize=10, fontName="Helvetica-Bold",   spaceAfter=2,  textColor=colors.HexColor("#374151"))
-    style_body  = ParagraphStyle("Body",  fontSize=9,  fontName="Helvetica",        spaceAfter=2,  leading=13)
-    style_small = ParagraphStyle("Small", fontSize=8,  fontName="Helvetica",        textColor=colors.HexColor("#6b7280"), spaceAfter=2)
-    style_label = ParagraphStyle("Label", fontSize=8,  fontName="Helvetica-Bold",   textColor=colors.HexColor("#0f3460"))
-    style_comment = ParagraphStyle("Cmt", fontSize=8,  fontName="Helvetica-Oblique",textColor=colors.HexColor("#374151"), spaceAfter=2, leading=12)
+    style_h1 = ParagraphStyle("H1", fontSize=14, fontName="Helvetica-Bold", spaceAfter=4, textColor=colors.HexColor("#0f3460"))
+    style_h3 = ParagraphStyle("H3", fontSize=10, fontName="Helvetica-Bold", spaceAfter=2, textColor=colors.HexColor("#374151"))
+    style_body = ParagraphStyle("Body", fontSize=9, fontName="Helvetica", spaceAfter=2, leading=13)
+    style_small = ParagraphStyle("Small", fontSize=8, fontName="Helvetica", textColor=colors.HexColor("#6b7280"), spaceAfter=2)
+    style_label = ParagraphStyle("Label", fontSize=8, fontName="Helvetica-Bold", textColor=colors.HexColor("#0f3460"))
+    style_comment = ParagraphStyle("Cmt", fontSize=8, fontName="Helvetica-Oblique", textColor=colors.HexColor("#374151"), spaceAfter=2, leading=12)
 
-    story = []
-
-    # Cover / header
-    story.append(Paragraph(f"Evidence Pack — {class_code} / {quiz_code}", style_h1))
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#0f3460"), spaceAfter=6))
+    story = [Paragraph("Evidence Pack", style_h1), HRFlowable(width="100%", thickness=1, color=colors.HexColor("#0f3460"), spaceAfter=6)]
 
     for idx, attempt in enumerate(attempts_data):
-        email      = attempt.get("student_email", "")
-        cand       = candidate_map.get(email.lower(), {})
-        full_name  = f"{cand.get('forename','')} {cand.get('surname','')}".strip() or email
-        cand_no    = cand.get("candidate_no", "—")
-        form       = cand.get("form", "—")
-        year       = cand.get("year_group", "—")
-        uci        = cand.get("uci", "—")
+      email = attempt.get("student_email", "")
+      candidate = candidate_map.get(email.lower(), {})
+      full_name = f"{candidate.get('forename', '')} {candidate.get('surname', '')}".strip() or email
+      candidate_no = candidate.get("candidate_no", "—")
+      school_code = centre_number or candidate.get("school_code", "—")
 
-        awarded    = attempt.get("marks_awarded")
-        possible   = attempt.get("marks_possible")
-        percentage = attempt.get("percentage")
+      awarded = attempt.get("marks_awarded")
+      possible = attempt.get("marks_possible")
+      percentage = attempt.get("percentage")
+      quiz_length = attempt.get("_quiz_length_minutes") or (round(possible) if possible is not None else "—")
 
-        # Try multiple possible key names for the questions list
-        questions = (
-            attempt.get("questions")
-            or attempt.get("question_list")
-            or attempt.get("responses")
-            or attempt.get("answers")
-            or attempt.get("items")
-            or attempt.get("quiz_responses")
-            or []
-        )
+      questions = (
+        attempt.get("questions")
+        or attempt.get("question_list")
+        or attempt.get("responses")
+        or attempt.get("answers")
+        or attempt.get("items")
+        or attempt.get("quiz_responses")
+        or []
+      )
 
-        # Student header block
-        header_data = [
-            [Paragraph("Name", style_label),        Paragraph(full_name, style_body),
-             Paragraph("Candidate #", style_label),  Paragraph(cand_no, style_body)],
-            [Paragraph("Email", style_label),        Paragraph(email, style_body),
-             Paragraph("Form / Year", style_label),  Paragraph(f"{form} — {year}", style_body)],
-            [Paragraph("UCI", style_label),          Paragraph(uci, style_body),
-             Paragraph("Quiz", style_label),         Paragraph(quiz_code, style_body)],
-        ]
-        if inc_marks and awarded is not None:
-            pct_str = f"{percentage:.1f}%" if percentage is not None else "—"
-            header_data.append([
-                Paragraph("Marks", style_label),
-                Paragraph(f"{awarded} / {possible}", style_body),
-                Paragraph("Percentage", style_label),
-                Paragraph(pct_str, style_body),
-            ])
+      header_data = [
+        [Paragraph("Candidate name", style_label), Paragraph(_pdf_text(full_name), style_body),
+         Paragraph("Centre number", style_label), Paragraph(_pdf_text(school_code), style_body)],
+        [Paragraph("Candidate #", style_label), Paragraph(_pdf_text(candidate_no), style_body),
+         Paragraph("Quiz length", style_label), Paragraph(_pdf_text(f"~{quiz_length} min"), style_body)],
+      ]
 
-        col_w = usable_w / 4
-        tbl = Table(header_data, colWidths=[col_w * 0.7, col_w * 1.3, col_w * 0.7, col_w * 1.3])
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f0f4ff")),
-            ("BOX",        (0, 0), (-1, -1), 0.5, colors.HexColor("#c7d2fe")),
-            ("INNERGRID",  (0, 0), (-1, -1), 0.3, colors.HexColor("#e0e7ff")),
-            ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING",    (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 6),
-        ]))
-        story.append(KeepTogether([tbl]))
-        story.append(Spacer(1, 6 * mm))
+      if inc_marks or inc_percentage:
+        marks_text = f"{awarded} / {possible}" if inc_marks and awarded is not None else "—"
+        pct_text = f"{percentage:.1f}%" if percentage is not None else "—"
+        header_data.append([
+          Paragraph("Total marks", style_label),
+          Paragraph(_pdf_text(marks_text if inc_marks else "—"), style_body),
+          Paragraph("Percentage", style_label),
+          Paragraph(_pdf_text(pct_text if inc_percentage else "—"), style_body),
+        ])
 
-        # Questions
-        if not questions:
-            story.append(Paragraph(
-                "⚠ No question/answer data was returned by the API for this attempt. "
-                "Visit /debug/attempt?class_code=…&quiz_code=… to inspect the raw response.",
-                ParagraphStyle("Warn", fontSize=9, textColor=colors.HexColor("#991b1b"),
-                               fontName="Helvetica-Oblique")
-            ))
-            story.append(Spacer(1, 4 * mm))
+      col_w = usable_w / 4
+      table = Table(header_data, colWidths=[col_w * 0.7, col_w * 1.3, col_w * 0.7, col_w * 1.3])
+      table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f0f4ff")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c7d2fe")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e0e7ff")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+      ]))
+      story.append(KeepTogether([table]))
+      story.append(Spacer(1, 6 * mm))
 
-        for q_idx, q in enumerate(questions, 1):
-            q_text     = q.get("question") or ""
-            q_image    = q.get("question_image_url") or ""
-            ans_text   = q.get("answer_text") or ""
-            ans_image  = q.get("answer_image_url") or ""
-            q_marks    = q.get("marks")           # marks awarded
-            q_possible = q.get("maxmarks")        # max marks
-            comment    = q.get("comment") or ""
-            has_image  = q.get("has_image", False)
+      if not questions:
+        story.append(Paragraph(
+          "⚠ No question/answer data was returned by the API for this attempt. Visit /debug/attempt?class_code=…&quiz_code=… to inspect the raw response.",
+          ParagraphStyle("Warn", fontSize=9, textColor=colors.HexColor("#991b1b"), fontName="Helvetica-Oblique"),
+        ))
+        story.append(Spacer(1, 4 * mm))
 
-            # Image-only response: answer_image_url is set, or has_image=True with no answer_text
-            is_img_ans = bool(ans_image) or (has_image and not ans_text.strip())
+      for q_idx, question in enumerate(questions, 1):
+        question_text, question_image_url = _question_prompt_parts(question)
+        answer_text, answer_image_url, is_image_answer = _question_answer_parts(question)
+        question_marks = question.get("marks")
+        question_possible = question.get("maxmarks")
+        comment = question.get("comment") or ""
 
-            # answer_raw kept for helper compatibility
-            answer_raw = ans_image if is_img_ans else ans_text
+        question_block = []
+        question_label = f"Q{q_idx}"
+        question_block.append(Paragraph(question_label, style_h3))
 
-            q_block = []
-
-            # Question header
-            q_label = f"Q{q_idx}"
-            if inc_marks and q_possible is not None:
-                q_label += f"  [{q_marks if q_marks is not None else '—'} / {q_possible} marks]"
-            q_block.append(Paragraph(q_label, style_h3))
-
-            # Question text / image
-            if inc_questions:
-                if q_text:
-                    for line in q_text.split("\n"):
-                        if line.strip():
-                            q_block.append(Paragraph(line, style_body))
-                if q_image:
-                    img_buf = _download_image(q_image)
-                    if img_buf:
-                        try:
-                            pil = PILImage.open(img_buf)
-                            iw, ih = pil.size
-                            img_buf.seek(0)
-                            disp_w = min(usable_w * (img_pct / 100), usable_w)
-                            disp_h = ih * (disp_w / iw)
-                            q_block.append(RLImage(img_buf, width=disp_w, height=disp_h))
-                        except Exception:
-                            q_block.append(Paragraph("[Question image could not be loaded]", style_small))
-
-            # Separator
-            q_block.append(Paragraph("Student response:", style_label))
-
-            # Student answer
-            if is_img_ans:
-                img_buf = _download_image(ans_image)
-                if img_buf:
-                    try:
-                        pil = PILImage.open(img_buf)
-                        iw, ih = pil.size
-                        img_buf.seek(0)
-                        disp_w = min(usable_w * (img_pct / 100), usable_w)
-                        disp_h = ih * (disp_w / iw)
-                        q_block.append(RLImage(img_buf, width=disp_w, height=disp_h))
-                    except Exception:
-                        q_block.append(Paragraph("[Response image could not be loaded]", style_small))
-                else:
-                    q_block.append(Paragraph("[Image response — could not download]", style_small))
+        if inc_questions:
+          if question_text:
+            for line in question_text.split("\n"):
+              if line.strip():
+                question_block.append(Paragraph(_pdf_text(line), style_body))
+          if question_image_url:
+            question_image = _build_pdf_image(
+              question_image_url,
+              max_width=usable_w,
+              max_height=question_img_h,
+              img_pct=img_pct,
+            )
+            if question_image:
+              question_block.append(question_image)
             else:
-                if ans_text:
-                    for line in ans_text.split("\n"):
-                        q_block.append(Paragraph(line or " ", style_body))
-                else:
-                    q_block.append(Paragraph("(no response)", style_small))
+              question_block.append(Paragraph("[Question image could not be loaded]", style_small))
 
-            # Examiner comment
-            if inc_comments and comment:
-                q_block.append(Spacer(1, 2 * mm))
-                q_block.append(Paragraph(f"Examiner comment: {comment}", style_comment))
+        if inc_question_marks:
+          max_marks_label = _format_question_max_marks(question_possible)
+          if max_marks_label:
+            question_block.append(Paragraph(_pdf_text(max_marks_label), style_small))
+            question_block.append(Spacer(1, 1.5 * mm))
 
-            q_block.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#d1d5db"), spaceAfter=4))
-            story.append(KeepTogether(q_block))
+        if inc_labels:
+          question_block.append(Paragraph("Student response:", style_label))
+          question_block.append(Spacer(1, 3 * mm))
 
-        # Page break between students
-        if page_break_between and idx < len(attempts_data) - 1:
-            from reportlab.platypus import PageBreak
-            story.append(PageBreak())
+        if is_image_answer:
+          response_image = _build_pdf_image(
+            answer_image_url,
+            max_width=usable_w,
+            max_height=response_img_h,
+            img_pct=img_pct,
+            crop_top_pct=img_crop_pct,
+          )
+          if response_image:
+            question_block.append(response_image)
+          else:
+            question_block.append(Paragraph("[Image response could not be loaded]", style_small))
         else:
-            story.append(Spacer(1, 10 * mm))
+          if answer_text:
+            for line in answer_text.split("\n"):
+              question_block.append(Paragraph(_pdf_text(line) or " ", style_body))
+          else:
+            question_block.append(Paragraph("(no response)", style_small))
+
+        if inc_comments and comment:
+          question_block.append(Spacer(1, 2 * mm))
+          question_block.append(Paragraph(_pdf_text(f"Examiner comment: {comment}"), style_comment))
+
+        question_block.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#d1d5db"), spaceAfter=4))
+        story.extend(question_block)
+
+      if page_break_between and idx < len(attempts_data) - 1:
+        story.append(PageBreak())
+      else:
+        story.append(Spacer(1, 10 * mm))
 
     doc.build(story)
     buf.seek(0)
@@ -1288,16 +2189,7 @@ def pdf():
     class_code   = request.args.get("class_code", "").strip()
     quiz_code    = request.args.get("quiz_code", "").strip()
     student_email = request.args.get("student_email", "").strip().lower()
-
-    inc_marks     = bool(request.args.get("inc_marks"))
-    inc_comments  = bool(request.args.get("inc_comments"))
-    inc_questions = bool(request.args.get("inc_questions"))
-    inc_labels    = bool(request.args.get("inc_labels"))
-    margin_tb     = float(request.args.get("margin_tb", 15))
-    margin_lr     = float(request.args.get("margin_lr", 15))
-    img_pct       = float(request.args.get("img_pct", 100))
-    img_crop_pct  = float(request.args.get("img_crop_pct", 3))
-    page_break    = request.args.get("page_break", "1") == "1"
+    pdf_options = _pdf_request_options(request.args)
 
     if not class_code or not quiz_code:
         return "Missing class_code or quiz_code", 400
@@ -1313,38 +2205,15 @@ def pdf():
     if student_email:
         attempts_raw = [a for a in attempts_raw if a.get("student_email", "").lower() == student_email]
 
-    # Normalise question key — API may use different names
-    enriched = []
-    for a in attempts_raw:
-        if not a.get("questions"):
-            for alt in ("question_list", "responses", "answers", "items", "quiz_responses"):
-                if a.get(alt):
-                    a = {**a, "questions": a[alt]}
-                    break
-        enriched.append(a)
+    enriched = [_normalise_attempt_questions(attempt) for attempt in attempts_raw]
 
     print(f"[PDF] {len(enriched)} attempt(s). First has {len(enriched[0].get('questions', []))} questions." if enriched else "[PDF] No attempts.")
 
-    # Build candidate lookup map
-    emails = [a.get("student_email", "").lower() for a in enriched]
-    db = get_db()
-    candidate_map = {}
-    for em in emails:
-        row = db.execute("SELECT * FROM candidates WHERE email=?", (em,)).fetchone()
-        if row:
-            candidate_map[em] = dict(row)
+    candidate_map = _build_candidate_map([a.get("student_email", "") for a in enriched])
 
     pdf_buf = generate_pdf(
         class_code, quiz_code, enriched, candidate_map,
-        inc_marks=inc_marks,
-        inc_comments=inc_comments,
-        inc_questions=inc_questions,
-        inc_labels=inc_labels,
-        margin_tb=margin_tb,
-        margin_lr=margin_lr,
-        img_pct=img_pct,
-        img_crop_pct=img_crop_pct,
-        page_break_between=page_break,
+        **pdf_options,
     )
 
     filename = f"evidence_{class_code}_{quiz_code}.pdf".replace(" ", "_")
@@ -1365,6 +2234,7 @@ def evidence():
     target_min    = int(request.args.get("target_min", 50))
     target_max    = int(request.args.get("target_max", 70))
     manual_codes  = request.args.get("quiz_codes", "").strip()
+    merge_groups_raw = request.args.get("merge_groups", "").strip()
     months_ago_raw = request.args.get("months_ago", "").strip()
     months_ago    = int(months_ago_raw) if months_ago_raw.isdigit() else None
     spec_code     = request.args.get("spec_code", "").strip()
@@ -1372,16 +2242,32 @@ def evidence():
     ev_results      = []
     all_quizzes     = []
     student_evidence = []
+    merged_assessments = []
     error           = None
     quizzes_checked = 0
+    merge_groups    = parse_merge_groups(merge_groups_raw, name_prefix="assessment_merge")
 
     if class_code:
         try:
             infos, raw_by_quiz = discover_quiz_summaries(class_code, manual_codes, months_ago, spec_code)
             quizzes_checked = len(infos)
-            all_quizzes = sorted(infos, key=lambda x: x["est_minutes"], reverse=True)
-            ev_results = find_best_evidence(infos, target_min=target_min, target_max=target_max, top_n=3)
-            student_evidence = compute_per_student_evidence(raw_by_quiz, target_min, target_max, top_n=3)
+
+            explicit_merge_codes = [quiz_code for group in merge_groups for quiz_code in group["quiz_codes"]]
+            if explicit_merge_codes:
+                raw_by_quiz = ensure_quiz_attempt_groups(class_code, raw_by_quiz, explicit_merge_codes, months_ago)
+                existing_codes = {item["quiz_code"] for item in infos}
+                for quiz_code in explicit_merge_codes:
+                    if quiz_code in existing_codes:
+                        continue
+                    infos.extend(_summaries_from_groups({quiz_code: raw_by_quiz.get(quiz_code, [])}))
+                    existing_codes.add(quiz_code)
+
+            merged_infos, merged_details = build_merged_quiz_summaries(raw_by_quiz, merge_groups)
+            merged_assessments = [{**item, "student_rows": merged_details.get(item["quiz_code"], [])} for item in merged_infos]
+            all_quizzes = sorted(infos + merged_infos, key=lambda x: x["est_minutes"], reverse=True)
+            ev_results = find_best_evidence(all_quizzes, target_min=target_min, target_max=target_max, top_n=3)
+            student_evidence = compute_per_student_evidence(raw_by_quiz, target_min, target_max, top_n=3, merge_groups=merge_groups)
+
             # Enrich with candidate DB info
             db = get_db()
             for s in student_evidence:
@@ -1393,6 +2279,17 @@ def evidence():
                 else:
                     s["candidate_no"] = "—"
                     s["full_name"] = ""
+
+            for merged in merged_assessments:
+                for row in merged["student_rows"]:
+                    candidate = db.execute("SELECT * FROM candidates WHERE email=?", (row["email"],)).fetchone()
+                    if candidate:
+                        candidate = dict(candidate)
+                        row["candidate_no"] = candidate.get("candidate_no", "—")
+                        row["full_name"] = f"{candidate.get('forename', '')} {candidate.get('surname', '')}".strip()
+                    else:
+                        row["candidate_no"] = "—"
+                        row["full_name"] = ""
         except requests.HTTPError as e:
             body = {}
             try: body = e.response.json()
@@ -1411,19 +2308,6 @@ def evidence():
                 "to see the raw attempt structure, then enter quiz codes manually above."
             )
 
-    # Build hidden PDF options HTML (no student-specific inputs here — added per-form in template)
-    pdf_options_html = """
-<input type="hidden" name="inc_marks" value="1">
-<input type="hidden" name="inc_comments" value="1">
-<input type="hidden" name="inc_questions" value="1">
-<input type="hidden" name="inc_labels" value="1">
-<input type="hidden" name="margin_tb" value="15">
-<input type="hidden" name="margin_lr" value="15">
-<input type="hidden" name="img_pct" value="100">
-<input type="hidden" name="img_crop_pct" value="3">
-<input type="hidden" name="page_break" value="1">
-"""
-
     return render_template_string(
         EVIDENCE_TEMPLATE,
         class_code=class_code,
@@ -1431,35 +2315,107 @@ def evidence():
         target_min=target_min,
         target_max=target_max,
         quiz_codes=manual_codes,
+        merge_groups_raw=merge_groups_raw,
         months_ago=months_ago_raw,
         spec_code=spec_code,
         evidence=ev_results,
         all_quizzes=all_quizzes,
         quizzes_checked=quizzes_checked,
         student_evidence=student_evidence,
+        merged_assessments=merged_assessments,
         error=error,
-        pdf_options_html=pdf_options_html,
+        render_pdf_options=render_pdf_options,
         grade_of=grade_suggestion,
+        grade_class_of=grade_badge_class,
     )
+
+
+@app.route("/evidence/planner")
+def evidence_planner():
+  class_code = request.args.get("class_code", "").strip()
+  quiz_codes_raw = request.args.get("quiz_codes", "").strip()
+  merge_groups_raw = request.args.get("merge_groups", "").strip()
+  selected_candidate_nos = [value.strip() for value in request.args.getlist("selected_candidate") if value.strip()]
+
+  quiz_codes = parse_code_list(quiz_codes_raw)
+  evidence_rows = load_existing_evidence_rows()
+  candidate_map = lookup_candidates_by_candidate_numbers([row["candidate_no"] for row in evidence_rows])
+
+  students = []
+  selected_set = set(selected_candidate_nos)
+  for row in evidence_rows:
+    candidate = candidate_map.get(row["candidate_no"], {})
+    display_name = f"{candidate.get('forename', '')} {candidate.get('surname', '')}".strip() or row["student_name"]
+    students.append({
+      **row,
+      "display_name": display_name,
+      "email": candidate.get("email", ""),
+      "selected": row["candidate_no"] in selected_set,
+    })
+
+  selected_results = []
+  error = None
+  merge_groups = parse_merge_groups(merge_groups_raw, quiz_codes)
+
+  if class_code or quiz_codes_raw or selected_candidate_nos:
+    if not class_code:
+      error = "Enter a class code."
+    elif not quiz_codes:
+      error = "Enter at least one quiz code."
+    elif not selected_candidate_nos:
+      error = "Select at least one student."
+    else:
+      try:
+        raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
+        student_score_map = build_student_quiz_score_map(raw_by_quiz)
+        for student in students:
+          if not student["selected"]:
+            continue
+          email = (student.get("email") or "").lower()
+          score_map = student_score_map.get(email, {}) if email else {}
+          selected_results.append({
+            "candidate_no": student["candidate_no"],
+            "display_name": student["display_name"],
+            "email": student["email"],
+            "existing_items": student["existing_items"],
+            "quiz_scores": [score_map.get(quiz_code, {"percentage": None, "minutes": None}) for quiz_code in quiz_codes],
+            "merged_scores": build_merged_score_rows(score_map, merge_groups),
+          })
+      except requests.HTTPError as e:
+        body = {}
+        try:
+          body = e.response.json()
+        except Exception:
+          pass
+        error = f"API error {e.response.status_code}: {body.get('error', str(e))}"
+      except requests.RequestException as e:
+        error = f"Request failed: {e}"
+      except Exception as e:
+        error = f"Error: {e}"
+
+  return render_template_string(
+    PLANNER_TEMPLATE,
+    class_code=class_code,
+    quiz_codes=quiz_codes,
+    quiz_codes_raw=quiz_codes_raw,
+    merge_groups=merge_groups,
+    merge_groups_raw=merge_groups_raw,
+    students=students,
+    selected_results=selected_results,
+    error=error,
+    grade_of=grade_suggestion,
+    grade_class_of=grade_badge_class,
+    grade_thresholds=grade_threshold_rows(),
+  )
 
 
 @app.route("/evidence/pdf")
 def evidence_pdf():
     """PDF download triggered from the evidence tab — proxies to /pdf logic."""
-    # Reuse the same /pdf handler parameters
     class_code    = request.args.get("class_code", "").strip()
     quiz_code     = request.args.get("quiz_code", "").strip()
     student_email = request.args.get("student_email", "").strip().lower()
-
-    inc_marks     = bool(request.args.get("inc_marks"))
-    inc_comments  = bool(request.args.get("inc_comments"))
-    inc_questions = bool(request.args.get("inc_questions"))
-    inc_labels    = bool(request.args.get("inc_labels"))
-    margin_tb     = float(request.args.get("margin_tb", 15))
-    margin_lr     = float(request.args.get("margin_lr", 15))
-    img_pct       = float(request.args.get("img_pct", 100))
-    img_crop_pct  = float(request.args.get("img_crop_pct", 3))
-    page_break    = request.args.get("page_break", "1") == "1"
+    pdf_options = _pdf_request_options(request.args)
 
     if not class_code or not quiz_code:
         return "Missing class_code or quiz_code", 400
@@ -1475,37 +2431,54 @@ def evidence_pdf():
     if student_email:
         attempts_raw = [a for a in attempts_raw if a.get("student_email", "").lower() == student_email]
 
-    enriched = []
-    for a in attempts_raw:
-        if not a.get("questions"):
-            for alt in ("question_list", "responses", "answers", "items", "quiz_responses"):
-                if a.get(alt):
-                    a = {**a, "questions": a[alt]}
-                    break
-        enriched.append(a)
+    enriched = [_normalise_attempt_questions(attempt) for attempt in attempts_raw]
 
-    emails = [a.get("student_email", "").lower() for a in enriched]
-    db = get_db()
-    candidate_map = {}
-    for em in emails:
-        row = db.execute("SELECT * FROM candidates WHERE email=?", (em,)).fetchone()
-        if row:
-            candidate_map[em] = dict(row)
+    candidate_map = _build_candidate_map([a.get("student_email", "") for a in enriched])
 
     pdf_buf = generate_pdf(
         class_code, quiz_code, enriched, candidate_map,
-        inc_marks=inc_marks,
-        inc_comments=inc_comments,
-        inc_questions=inc_questions,
-        inc_labels=inc_labels,
-        margin_tb=margin_tb,
-        margin_lr=margin_lr,
-        img_pct=img_pct,
-        img_crop_pct=img_crop_pct,
-        page_break_between=page_break,
+        **pdf_options,
     )
 
     filename = f"evidence_{class_code}_{quiz_code}.pdf".replace(" ", "_")
+    return send_file(pdf_buf, mimetype="application/pdf",
+                     as_attachment=True, download_name=filename)
+
+
+@app.route("/evidence/pdf/merged")
+def evidence_pdf_merged():
+    class_code = request.args.get("class_code", "").strip()
+    student_email = request.args.get("student_email", "").strip().lower()
+    quiz_codes = parse_code_list(request.args.get("quiz_codes", ""))
+    pdf_options = _pdf_request_options(request.args)
+
+    if not class_code or len(quiz_codes) < 2:
+        return "Missing class_code or at least two quiz codes", 400
+
+    try:
+        raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
+    except requests.HTTPError as e:
+        return f"API error: {e}", 502
+    except requests.RequestException as e:
+        return f"Request failed: {e}", 502
+
+    best_attempts = build_student_best_attempt_map(raw_by_quiz)
+    merged_attempts, eligible_emails = build_merged_pdf_attempts(best_attempts, quiz_codes, student_email)
+
+    if not merged_attempts:
+        return "No students have a complete merged attempt for those quiz codes", 404
+
+    candidate_map = _build_candidate_map(eligible_emails)
+    pdf_buf = generate_pdf(
+        class_code,
+      "evidence",
+        merged_attempts,
+        candidate_map,
+        **pdf_options,
+    )
+
+    merged_name = request.args.get("merged_name", "").strip() or "merged_assessment"
+    filename = f"evidence_{class_code}_{merged_name}.pdf".replace(" ", "_")
     return send_file(pdf_buf, mimetype="application/pdf",
                      as_attachment=True, download_name=filename)
 
