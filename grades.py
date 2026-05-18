@@ -36,6 +36,14 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "candidates.db")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "candidates.csv")
 EVIDENCE_STATUS_CSV_PATH = os.path.join(os.path.dirname(__file__), "y11scores.csv")
 
+EXISTING_EVIDENCE_MINUTES = 60
+PLANNER_TARGET_MINUTES = 60
+PLANNER_TARGET_MAX_MINUTES = 70
+PLANNER_LINK_DAYS = 7
+CSV_EVIDENCE_QUIZ_CODE_MAP = {
+  "April 30 Mock": "april30mock",
+}
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -185,12 +193,23 @@ def load_existing_evidence_rows() -> list:
         score = parse_percentage(row.get(column))
         if score is None:
           continue
+        mapped_quiz_code = CSV_EVIDENCE_QUIZ_CODE_MAP.get(column)
+        source_code = mapped_quiz_code or f"existing:{column}"
         existing_items.append({
           "label": column,
           "percentage": score,
           "display": f"{score:.0f}%",
           "grade_label": grade_suggestion(score),
           "grade_class": grade_badge_class(score),
+          "quiz_code": source_code,
+          "source_quiz_codes": [source_code],
+          "source_label": column,
+          "avg_percentage": score,
+          "avg_marks_possible": EXISTING_EVIDENCE_MINUTES,
+          "est_minutes": EXISTING_EVIDENCE_MINUTES,
+          "total_minutes": EXISTING_EVIDENCE_MINUTES,
+          "type": "existing",
+          "attempt_date": None,
         })
       rows.append({
         "candidate_no": candidate_no,
@@ -199,6 +218,233 @@ def load_existing_evidence_rows() -> list:
         "evidence_count": len(existing_items),
       })
   return rows
+
+
+def _normalise_planner_item(item: dict) -> dict:
+  minutes = item.get("est_minutes")
+  if not minutes:
+    minutes = item.get("minutes") or round(item.get("marks_possible") or 0)
+
+  avg_marks_possible = item.get("avg_marks_possible")
+  if not avg_marks_possible:
+    avg_marks_possible = item.get("marks_possible") or minutes or 0
+
+  avg_percentage = item.get("avg_percentage")
+  if avg_percentage is None:
+    avg_percentage = item.get("percentage")
+
+  return {
+    **item,
+    "label": item.get("label") or item.get("quiz_code") or "Evidence",
+    "source_quiz_codes": item.get("source_quiz_codes") or [item.get("quiz_code") or item.get("label") or "Evidence"],
+    "est_minutes": round(minutes or 0),
+    "avg_marks_possible": avg_marks_possible or 0,
+    "avg_percentage": avg_percentage,
+  }
+
+
+def _planner_candidate_from_items(
+  items: list[dict],
+  target_min: int = PLANNER_TARGET_MINUTES,
+  target_max: int = PLANNER_TARGET_MAX_MINUTES,
+  source: str = "quiz",
+) -> dict | None:
+  if not items:
+    return None
+
+  normalised = [_normalise_planner_item(item) for item in items]
+  valid_percentages = [item.get("avg_percentage") for item in normalised if item.get("avg_percentage") is not None]
+  if not valid_percentages:
+    return None
+
+  total_minutes = sum(item.get("est_minutes") or 0 for item in normalised)
+  total_marks = sum(item.get("avg_marks_possible") or 0 for item in normalised)
+  if total_marks > 0 and len(valid_percentages) == len(normalised):
+    avg_percentage = sum(
+      (item.get("avg_percentage") or 0) * (item.get("avg_marks_possible") or 0)
+      for item in normalised
+    ) / total_marks
+  else:
+    avg_percentage = sum(valid_percentages) / len(valid_percentages)
+
+  dates = [item.get("attempt_date") for item in normalised if item.get("attempt_date") is not None]
+  first_date = min(dates) if dates else None
+  last_date = max(dates) if dates else None
+  span_days = None
+  date_span = None
+  linked_reason = None
+  if first_date and last_date:
+    span_days = (last_date.date() - first_date.date()).days
+    if span_days == 0:
+      date_span = first_date.strftime("%d %b %Y")
+    else:
+      date_span = f"{first_date.strftime('%d %b %Y')} to {last_date.strftime('%d %b %Y')}"
+    if len(normalised) > 1:
+      linked_reason = (
+        f"{len(normalised)} quizzes across {span_days + 1} days"
+        if span_days > 0 else
+        f"{len(normalised)} quizzes on the same day"
+      )
+
+  score = _evidence_score(total_minutes, avg_percentage, target_min, target_max)
+  if span_days is not None:
+    score += max(0, PLANNER_LINK_DAYS - min(span_days, PLANNER_LINK_DAYS)) / 100
+
+  label = normalised[0].get("label") if len(normalised) == 1 else " + ".join(item.get("label") or item.get("quiz_code") or "Evidence" for item in normalised)
+  source_quiz_codes = []
+  for item in normalised:
+    for code in item.get("source_quiz_codes") or []:
+      if code not in source_quiz_codes:
+        source_quiz_codes.append(code)
+
+  return {
+    "type": "existing" if source == "csv" else ("linked" if len(normalised) > 1 else "single"),
+    "source": source,
+    "quizzes": normalised,
+    "quiz_codes": [item.get("quiz_code") or item.get("label") for item in normalised],
+    "source_quiz_codes": source_quiz_codes,
+    "total_minutes": total_minutes,
+    "avg_percentage": avg_percentage,
+    "grade": grade_suggestion(avg_percentage),
+    "grade_class": grade_badge_class(avg_percentage),
+    "score": score,
+    "label": label,
+    "date_span": date_span,
+    "span_days": span_days,
+    "linked_reason": linked_reason,
+  }
+
+
+def build_existing_evidence_candidates(
+  existing_items: list[dict],
+  target_min: int = PLANNER_TARGET_MINUTES,
+  target_max: int = PLANNER_TARGET_MAX_MINUTES,
+) -> list[dict]:
+  candidates = []
+  for item in existing_items:
+    candidate = _planner_candidate_from_items([item], target_min=target_min, target_max=target_max, source="csv")
+    if candidate is None:
+      continue
+    candidate["linked_reason"] = "Existing CSV evidence"
+    candidates.append(candidate)
+  return candidates
+
+
+def choose_top_evidence_pieces(candidates: list[dict], top_n: int = 3) -> list[dict]:
+  ordered = sorted(
+    candidates,
+    key=lambda item: (
+      -(item.get("score") or 0),
+      -((item.get("avg_percentage") or -1)),
+      item.get("span_days") if item.get("span_days") is not None else 999,
+      -(item.get("total_minutes") or 0),
+      item.get("label") or "",
+    ),
+  )
+
+  chosen = []
+  used_sources = set()
+  for item in ordered:
+    source_codes = set(item.get("source_quiz_codes") or [])
+    if used_sources & source_codes:
+      continue
+    chosen.append(item)
+    used_sources.update(source_codes)
+    if len(chosen) >= top_n:
+      break
+  return chosen
+
+
+def build_planner_quiz_candidates(
+  score_map: dict,
+  excluded_quiz_codes: set[str] | None = None,
+  target_min: int = PLANNER_TARGET_MINUTES,
+  target_max: int = PLANNER_TARGET_MAX_MINUTES,
+  max_days_apart: int = PLANNER_LINK_DAYS,
+  max_quizzes: int = 4,
+  top_n: int = 5,
+) -> list[dict]:
+  excluded = {str(code).strip().lower() for code in (excluded_quiz_codes or set()) if str(code).strip()}
+  items = []
+  for item in score_map.values():
+    quiz_code = str(item.get("quiz_code") or "").strip()
+    if not quiz_code or quiz_code.lower() in excluded:
+      continue
+    normalised = _normalise_planner_item(item)
+    if normalised.get("avg_percentage") is None:
+      continue
+    items.append(normalised)
+
+  if not items:
+    return []
+
+  candidate_map = {}
+
+  def store(group_items: list[dict]):
+    candidate = _planner_candidate_from_items(group_items, target_min=target_min, target_max=target_max, source="quiz")
+    if candidate is None or candidate.get("total_minutes", 0) < target_min:
+      return
+    key = tuple(candidate.get("source_quiz_codes") or [])
+    previous = candidate_map.get(key)
+    if previous is None or candidate.get("score", 0) > previous.get("score", 0):
+      candidate_map[key] = candidate
+
+  for item in items:
+    if (item.get("est_minutes") or 0) >= target_min:
+      store([item])
+
+  dated_items = sorted(
+    [item for item in items if item.get("attempt_date") is not None],
+    key=lambda item: (item.get("attempt_date"), item.get("quiz_code") or item.get("label") or ""),
+  )
+  for start in range(len(dated_items)):
+    group = []
+    first_date = dated_items[start].get("attempt_date")
+    for end in range(start, min(len(dated_items), start + max_quizzes)):
+      item = dated_items[end]
+      attempt_date = item.get("attempt_date")
+      if first_date and attempt_date and (attempt_date.date() - first_date.date()).days > max_days_apart:
+        break
+      group.append(item)
+      if len(group) >= 2:
+        store(group)
+      if sum(entry.get("est_minutes") or 0 for entry in group) > target_max + 20:
+        break
+
+  return choose_top_evidence_pieces(list(candidate_map.values()), top_n=top_n)
+
+
+def summarise_evidence_prediction(evidence_items: list[dict]) -> dict:
+  valid = [item for item in evidence_items if item.get("avg_percentage") is not None]
+  if not valid:
+    return {
+      "count": 0,
+      "percentage": None,
+      "grade": "No grade",
+      "grade_class": "?",
+    }
+
+  avg_percentage = sum(item.get("avg_percentage") or 0 for item in valid) / len(valid)
+  return {
+    "count": len(valid),
+    "percentage": avg_percentage,
+    "grade": grade_suggestion(avg_percentage),
+    "grade_class": grade_badge_class(avg_percentage),
+  }
+
+
+def find_better_quiz_evidence(existing_candidates: list[dict], quiz_candidates: list[dict], top_n: int = 3) -> list[dict]:
+  current_best = choose_top_evidence_pieces(existing_candidates, top_n=3)
+  current_percentages = [item.get("avg_percentage") for item in current_best if item.get("avg_percentage") is not None]
+  if len(current_percentages) < 3:
+    return choose_top_evidence_pieces(quiz_candidates, top_n=top_n)
+
+  threshold = min(current_percentages)
+  better_candidates = [
+    item for item in quiz_candidates
+    if item.get("avg_percentage") is not None and item.get("avg_percentage") > threshold
+  ]
+  return choose_top_evidence_pieces(better_candidates, top_n=top_n)
 
 
 def fetch_quiz_attempt_groups(class_code: str, quiz_codes: list[str], include_questions: bool = False) -> dict:
@@ -1495,9 +1741,11 @@ PLANNER_TEMPLATE = BASE_STYLE + """
 <div class="card">
   <h2>Evidence Planner</h2>
   <p class="info" style="margin-bottom:1rem">
-    This page uses the existing evidence file <strong>y11scores.csv</strong>. Tick the students you want,
-    enter quiz codes separated by commas, and optionally define merge groups using
-    <strong>semicolon-separated groups</strong> such as <strong>Q1+Q2; Q3+Q4</strong>.
+    This page uses the existing evidence file <strong>y11scores.csv</strong>. Each CSV score is treated as
+    a standalone 60+ minute evidence piece. Enter a class code, optionally add quiz codes, and the planner
+    will look for stronger live quiz evidence while excluding <strong>april30mock</strong>, which is already
+    represented in the CSV. Linked live evidence is limited to quizzes sat within roughly a week so you can
+    justify it as a short series of lessons.
   </p>
   <div style="display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:1rem">
     {% for band in grade_thresholds %}
@@ -1512,12 +1760,12 @@ PLANNER_TEMPLATE = BASE_STYLE + """
       <input type="text" name="class_code" value="{{ class_code }}" placeholder="e.g. oxaqa25" required>
     </label>
     <label>Quiz Codes
-      <input type="text" name="quiz_codes" value="{{ quiz_codes_raw }}" placeholder="Q1, Q2, Q3" style="width:320px" required>
+      <input type="text" name="quiz_codes" value="{{ quiz_codes_raw }}" placeholder="Optional: Q1, Q2, Q3" style="width:320px">
     </label>
     <label>Merged Quiz Groups
       <input type="text" name="merge_groups" value="{{ merge_groups_raw }}" placeholder="Q1+Q2; Q3+Q4" style="width:320px">
     </label>
-    <button type="submit" class="btn">Show Scores</button>
+    <button type="submit" class="btn">Plan Evidence</button>
     <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = true)">Select All</button>
     <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = false)">Clear All</button>
 
@@ -1550,7 +1798,8 @@ PLANNER_TEMPLATE = BASE_STYLE + """
 <div class="card">
   <div class="meta">
     <div class="meta-item"><span>Selected Students</span><span>{{ selected_results|length }}</span></div>
-    <div class="meta-item"><span>Quizzes</span><span>{{ quiz_codes|length }}</span></div>
+    <div class="meta-item"><span>Quiz Codes Entered</span><span>{{ quiz_codes|length }}</span></div>
+    <div class="meta-item"><span>Live Quizzes Considered</span><span>{{ live_quiz_count }}</span></div>
     <div class="meta-item"><span>Merged Groups</span><span>{{ merge_groups|length }}</span></div>
   </div>
 </div>
@@ -1563,6 +1812,9 @@ PLANNER_TEMPLATE = BASE_STYLE + """
           <th>Candidate #</th>
           <th>Student</th>
           <th>Existing Evidence</th>
+          <th>Better Quiz Evidence</th>
+          <th>Best Available 3</th>
+          <th>Predicted Grade</th>
           {% for quiz_code in quiz_codes %}<th>{{ quiz_code }}</th>{% endfor %}
           {% for group in merge_groups %}<th>{{ group.label }}</th>{% endfor %}
         </tr>
@@ -1580,6 +1832,35 @@ PLANNER_TEMPLATE = BASE_STYLE + """
             <div class="score-chip score-chip-existing" style="margin-bottom:.35rem">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</div>
             {% endfor %}
             {% if not row.existing_items %}<span class="no-data">No existing evidence</span>{% endif %}
+          </td>
+          <td class="score-cell">
+            {% for item in row.better_quiz_options %}
+            <div class="score-chip score-chip-merge" style="margin-bottom:.35rem">{{ item.label }}: {{ "%.1f"|format(item.avg_percentage) }}% · {{ item.grade }}</div>
+            <div class="score-sub">~{{ item.total_minutes }} min{% if item.date_span %} · {{ item.date_span }}{% endif %}</div>
+            {% if item.linked_reason %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            {% endfor %}
+            {% if not row.better_quiz_options %}<span class="no-data">No better linked quiz evidence found</span>{% endif %}
+          </td>
+          <td class="score-cell">
+            {% for item in row.best_available %}
+            <div class="score-chip {{ 'score-chip-existing' if item.source == 'csv' else 'score-chip-merge' }}" style="margin-bottom:.35rem">{{ item.label }}: {{ "%.1f"|format(item.avg_percentage) }}% · {{ item.grade }}</div>
+            <div class="score-sub">{% if item.source == 'csv' %}CSV evidence{% else %}~{{ item.total_minutes }} min{% if item.date_span %} · {{ item.date_span }}{% endif %}{% endif %}</div>
+            {% if item.linked_reason and item.source == 'quiz' %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            {% endfor %}
+            {% if not row.best_available %}<span class="no-data">No evidence available</span>{% endif %}
+          </td>
+          <td class="score-cell">
+            {% if row.best_prediction.percentage is not none %}
+            <div class="score-main">{{ "%.1f"|format(row.best_prediction.percentage) }}%</div>
+            <div class="score-sub">Best {{ row.best_prediction.count }} evidence piece{{ 's' if row.best_prediction.count != 1 else '' }}</div>
+            <div class="score-chip" style="background:#f8fafc;border:1px solid #dbe3f0;color:#0f172a;margin-bottom:.35rem">
+              <span class="grade-badge grade-{{ row.best_prediction.grade_class }}" style="margin-left:0">{{ row.best_prediction.grade }}</span>
+            </div>
+            {% if row.current_prediction.percentage is not none %}<div class="score-sub">CSV-only best: {{ "%.1f"|format(row.current_prediction.percentage) }}%</div>{% endif %}
+            {% if row.improvement is not none and row.improvement > 0.05 %}<div class="score-sub">Improvement: +{{ "%.1f"|format(row.improvement) }}%</div>{% endif %}
+            {% else %}
+            <span class="no-data">No evidence available</span>
+            {% endif %}
           </td>
           {% for cell in row.quiz_scores %}
           <td class="score-cell">
@@ -2356,28 +2637,58 @@ def evidence_planner():
   selected_results = []
   error = None
   merge_groups = parse_merge_groups(merge_groups_raw, quiz_codes)
+  live_quiz_count = 0
 
   if class_code or quiz_codes_raw or selected_candidate_nos:
     if not class_code:
       error = "Enter a class code."
-    elif not quiz_codes:
-      error = "Enter at least one quiz code."
     elif not selected_candidate_nos:
       error = "Select at least one student."
     else:
       try:
-        raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
+        if quiz_codes:
+          raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
+          live_quiz_infos = _summaries_from_groups(raw_by_quiz)
+        else:
+          live_quiz_infos, raw_by_quiz = discover_quiz_summaries(class_code)
+
         student_score_map = build_student_quiz_score_map(raw_by_quiz)
+        excluded_quiz_codes = {code.lower() for code in CSV_EVIDENCE_QUIZ_CODE_MAP.values()}
+        live_quiz_count = sum(
+          1
+          for info in live_quiz_infos
+          if str(info.get("quiz_code") or "").strip().lower() not in excluded_quiz_codes
+        )
+
         for student in students:
           if not student["selected"]:
             continue
           email = (student.get("email") or "").lower()
           score_map = student_score_map.get(email, {}) if email else {}
+          existing_candidates = build_existing_evidence_candidates(student["existing_items"])
+          quiz_candidates = build_planner_quiz_candidates(
+            score_map,
+            excluded_quiz_codes=excluded_quiz_codes,
+          )
+          current_best = choose_top_evidence_pieces(existing_candidates, top_n=3)
+          current_prediction = summarise_evidence_prediction(current_best)
+          better_quiz_options = find_better_quiz_evidence(existing_candidates, quiz_candidates, top_n=3)
+          best_available = choose_top_evidence_pieces(existing_candidates + quiz_candidates, top_n=3)
+          best_prediction = summarise_evidence_prediction(best_available)
+          improvement = None
+          if current_prediction["percentage"] is not None and best_prediction["percentage"] is not None:
+            improvement = best_prediction["percentage"] - current_prediction["percentage"]
+
           selected_results.append({
             "candidate_no": student["candidate_no"],
             "display_name": student["display_name"],
             "email": student["email"],
             "existing_items": student["existing_items"],
+            "better_quiz_options": better_quiz_options,
+            "best_available": best_available,
+            "current_prediction": current_prediction,
+            "best_prediction": best_prediction,
+            "improvement": improvement,
             "quiz_scores": [score_map.get(quiz_code, {"percentage": None, "minutes": None}) for quiz_code in quiz_codes],
             "merged_scores": build_merged_score_rows(score_map, merge_groups),
           })
@@ -2403,6 +2714,7 @@ def evidence_planner():
     students=students,
     selected_results=selected_results,
     error=error,
+    live_quiz_count=live_quiz_count,
     grade_of=grade_suggestion,
     grade_class_of=grade_badge_class,
     grade_thresholds=grade_threshold_rows(),
