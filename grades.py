@@ -7,14 +7,18 @@ Then open http://127.0.0.1:5000 in your browser.
 import csv
 import html
 import io
+import mimetypes
 import os
 import sqlite3
 import base64
 import re
 import textwrap
+import unicodedata
+import zipfile
+from urllib.parse import urlencode
 
 import requests
-from flask import Flask, render_template_string, request, send_file, g
+from flask import Flask, render_template_string, request, send_file, g, redirect, abort
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -35,6 +39,27 @@ HEADERS = {"X-Api-Key": API_KEY}
 DB_PATH = os.path.join(os.path.dirname(__file__), "candidates.db")
 CSV_PATH = os.path.join(os.path.dirname(__file__), "candidates.csv")
 EVIDENCE_STATUS_CSV_PATH = os.path.join(os.path.dirname(__file__), "y11scores.csv")
+EXTERNAL_EVIDENCE_DIR = "/home/ashraf/Documents/worktodel/evidence 0984"
+PDF_ONLY_EXISTING_EVIDENCE_FOLDERS = {
+  "schoolasessment": {
+    "label": "School assessment",
+    "display": "PDF only",
+    "grade_label": "No score",
+  },
+  "Paper1evidence": {
+    "label": "April 30 Mock",
+    "display": "PDF available",
+    "grade_label": "Scored evidence",
+  },
+}
+PLANNER_EXISTING_FILE_FOLDERS = {
+  "January Mock 2026": "mocky11cs",
+  "April 30 Mock": "Paper1evidence",
+  "Paper 2": "Paper2evidence",
+  "Y11 Interim mock": "interimnov2025",
+  "Year 10 EOY": "y10EOY",
+  "School assessment": "schoolasessment",
+}
 
 EXISTING_EVIDENCE_MINUTES = 60
 PLANNER_TARGET_MINUTES = 60
@@ -42,6 +67,15 @@ PLANNER_TARGET_MAX_MINUTES = 70
 PLANNER_LINK_DAYS = 7
 CSV_EVIDENCE_QUIZ_CODE_MAP = {
   "April 30 Mock": "april30mock",
+}
+PLANNER_EXISTING_PREFERENCE = [
+  "January Mock 2026",
+  "Year 10 EOY",
+  "April 30 Mock",
+  "Paper 2",
+]
+PLANNER_EXISTING_PRIORITY = {
+  label: index for index, label in enumerate(PLANNER_EXISTING_PREFERENCE)
 }
 
 app = Flask(__name__)
@@ -55,6 +89,27 @@ def get_db():
     if db is None:
         db = g._database = sqlite3.connect(DB_PATH)
         db.row_factory = sqlite3.Row
+    db.execute("""
+      CREATE TABLE IF NOT EXISTS planner_student_state (
+        candidate_no TEXT PRIMARY KEY,
+        try_quiz_fit INTEGER NOT NULL DEFAULT 0,
+        is_done INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    """)
+    columns = {
+      row["name"]
+      for row in db.execute("PRAGMA table_info(planner_student_state)").fetchall()
+    }
+    if "excluded_existing_labels" not in columns:
+      db.execute("ALTER TABLE planner_student_state ADD COLUMN excluded_existing_labels TEXT NOT NULL DEFAULT ''")
+    if "excluded_quiz_codes" not in columns:
+      db.execute("ALTER TABLE planner_student_state ADD COLUMN excluded_quiz_codes TEXT NOT NULL DEFAULT ''")
+    if "saved_quiz_codes" not in columns:
+      db.execute("ALTER TABLE planner_student_state ADD COLUMN saved_quiz_codes TEXT NOT NULL DEFAULT ''")
+    if "saved_quiz_label" not in columns:
+      db.execute("ALTER TABLE planner_student_state ADD COLUMN saved_quiz_label TEXT NOT NULL DEFAULT ''")
+    db.commit()
     return db
 
 
@@ -153,6 +208,591 @@ def parse_code_list(value: str) -> list[str]:
     seen.add(code)
     codes.append(code)
   return codes
+
+
+def _request_flag(value: str | None) -> bool:
+  return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_planner_student_state(candidate_nos: list[str]) -> dict[str, dict]:
+  clean_numbers = [str(candidate_no).strip() for candidate_no in candidate_nos if str(candidate_no).strip()]
+  if not clean_numbers:
+    return {}
+
+  placeholders = ",".join("?" for _ in clean_numbers)
+  rows = get_db().execute(
+    f"SELECT candidate_no, try_quiz_fit, is_done, excluded_existing_labels, excluded_quiz_codes, saved_quiz_codes, saved_quiz_label FROM planner_student_state WHERE candidate_no IN ({placeholders})",
+    clean_numbers,
+  ).fetchall()
+  return {
+    row["candidate_no"]: {
+      "try_quiz_fit": bool(row["try_quiz_fit"]),
+      "is_done": bool(row["is_done"]),
+      "excluded_existing_labels": [label for label in parse_code_list(row["excluded_existing_labels"]) if label],
+      "excluded_quiz_codes": [code for code in parse_code_list(row["excluded_quiz_codes"]) if code],
+      "saved_quiz_codes": [code for code in parse_code_list(row["saved_quiz_codes"]) if code],
+      "saved_quiz_label": str(row["saved_quiz_label"] or "").strip(),
+    }
+    for row in rows
+  }
+
+
+def save_planner_student_state(state_by_candidate: dict[str, dict]) -> None:
+  rows = []
+  for candidate_no, state in state_by_candidate.items():
+    clean_candidate_no = str(candidate_no).strip()
+    if not clean_candidate_no:
+      continue
+    rows.append((
+      clean_candidate_no,
+      1 if state.get("try_quiz_fit") else 0,
+      1 if state.get("is_done") else 0,
+      ",".join(
+        label for label in state.get("excluded_existing_labels", []) if str(label).strip()
+      ),
+      ",".join(
+        code for code in state.get("excluded_quiz_codes", []) if str(code).strip()
+      ),
+      ",".join(
+        code for code in state.get("saved_quiz_codes", []) if str(code).strip()
+      ),
+      str(state.get("saved_quiz_label", "") or "").strip(),
+    ))
+
+  if not rows:
+    return
+
+  get_db().executemany(
+    """
+    INSERT INTO planner_student_state (candidate_no, try_quiz_fit, is_done, excluded_existing_labels, excluded_quiz_codes, saved_quiz_codes, saved_quiz_label)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(candidate_no) DO UPDATE SET
+      try_quiz_fit = excluded.try_quiz_fit,
+      is_done = excluded.is_done,
+      excluded_existing_labels = excluded.excluded_existing_labels,
+      excluded_quiz_codes = excluded.excluded_quiz_codes,
+      saved_quiz_codes = excluded.saved_quiz_codes,
+      saved_quiz_label = excluded.saved_quiz_label,
+      updated_at = CURRENT_TIMESTAMP
+    """,
+    rows,
+  )
+  get_db().commit()
+
+
+def toggle_saved_values(saved_values: list[str], toggle_values: list[str]) -> list[str]:
+  current = [value for value in saved_values if str(value).strip()]
+  current_set = set(current)
+  target = [value for value in toggle_values if str(value).strip()]
+  if not target:
+    return current
+
+  if all(value in current_set for value in target):
+    return [value for value in current if value not in target]
+
+  result = list(current)
+  for value in target:
+    if value not in current_set:
+      result.append(value)
+      current_set.add(value)
+  return result
+
+
+def build_external_evidence_index(candidate_nos: list[str]) -> dict[str, list[dict]]:
+  clean_numbers = {str(candidate_no).strip() for candidate_no in candidate_nos if str(candidate_no).strip()}
+  index = {candidate_no: [] for candidate_no in clean_numbers}
+  if not clean_numbers or not os.path.isdir(EXTERNAL_EVIDENCE_DIR):
+    return index
+
+  for root, _, filenames in os.walk(EXTERNAL_EVIDENCE_DIR):
+    for filename in sorted(filenames):
+      basename_matches = set(re.findall(r"\d{4,}", filename))
+      matched_numbers = clean_numbers & basename_matches
+      if not matched_numbers:
+        continue
+
+      abs_path = os.path.join(root, filename)
+      rel_path = os.path.relpath(abs_path, EXTERNAL_EVIDENCE_DIR)
+      for candidate_no in matched_numbers:
+        index.setdefault(candidate_no, []).append({
+          "name": filename,
+          "relative_path": rel_path,
+          "folder": os.path.dirname(rel_path),
+          "open_url": f"/evidence/planner/file?{urlencode({'candidate_no': candidate_no, 'path': rel_path})}",
+        })
+
+  for files in index.values():
+    files.sort(key=lambda item: (item["folder"], item["name"]))
+  return index
+
+
+def append_pdf_only_existing_evidence(existing_rows: list[dict], external_files_by_candidate: dict[str, list[dict]]) -> list[dict]:
+  enriched_rows = []
+  for row in existing_rows:
+    candidate_no = str(row.get("candidate_no") or "").strip()
+    existing_items = list(row.get("existing_items") or [])
+    existing_labels = {str(item.get("label") or "").strip() for item in existing_items}
+    for file_info in external_files_by_candidate.get(candidate_no, []):
+      folder_name = os.path.basename(str(file_info.get("folder") or "").strip())
+      folder_config = PDF_ONLY_EXISTING_EVIDENCE_FOLDERS.get(folder_name)
+      if not folder_config:
+        continue
+      label = folder_config["label"]
+      if label in existing_labels:
+        continue
+      existing_labels.add(label)
+      existing_items.append({
+        "label": label,
+        "percentage": None,
+        "display": folder_config["display"],
+        "grade_label": folder_config["grade_label"],
+        "grade_class": "?",
+        "quiz_code": f"existing-pdf:{label}",
+        "source_quiz_codes": [f"existing-pdf:{label}"],
+        "source_label": label,
+        "avg_percentage": None,
+        "avg_marks_possible": EXISTING_EVIDENCE_MINUTES,
+        "est_minutes": EXISTING_EVIDENCE_MINUTES,
+        "total_minutes": EXISTING_EVIDENCE_MINUTES,
+        "type": "existing_pdf",
+        "attempt_date": None,
+        "pdf_only": True,
+      })
+
+    enriched_rows.append({
+      **row,
+      "existing_items": existing_items,
+      "evidence_count": len(existing_items),
+    })
+  return enriched_rows
+
+
+def resolve_external_evidence_file(candidate_no: str, relative_path: str) -> str | None:
+  clean_candidate_no = str(candidate_no).strip()
+  clean_relative_path = os.path.normpath(str(relative_path or "").strip())
+  if not clean_candidate_no or not clean_relative_path or clean_relative_path.startswith(".."):
+    return None
+
+  full_path = os.path.abspath(os.path.join(EXTERNAL_EVIDENCE_DIR, clean_relative_path))
+  base_path = os.path.abspath(EXTERNAL_EVIDENCE_DIR)
+  if not full_path.startswith(base_path + os.sep):
+    return None
+  if not os.path.isfile(full_path):
+    return None
+  if clean_candidate_no not in os.path.basename(full_path):
+    return None
+  return full_path
+
+
+def _ascii_safe_slug(value: str, default: str = "item") -> str:
+  normalised = unicodedata.normalize("NFKD", str(value or ""))
+  ascii_text = normalised.encode("ascii", "ignore").decode("ascii")
+  cleaned = re.sub(r"[^A-Za-z0-9]+", "_", ascii_text).strip("_")
+  return cleaned or default
+
+
+def _planner_student_folder_name(display_name: str, candidate_no: str) -> str:
+  return f"{_ascii_safe_slug(display_name, 'student')}_{candidate_no}"
+
+
+def _planner_external_files_by_folder(external_files: list[dict]) -> dict[str, list[dict]]:
+  files_by_folder: dict[str, list[dict]] = {}
+  for file_info in external_files or []:
+    folder_name = os.path.basename(str(file_info.get("folder") or "").strip())
+    if not folder_name:
+      continue
+    files_by_folder.setdefault(folder_name, []).append(file_info)
+  return files_by_folder
+
+
+def _planner_existing_file_info(row: dict, label: str) -> dict | None:
+  folder_name = PLANNER_EXISTING_FILE_FOLDERS.get(str(label or "").strip())
+  if not folder_name:
+    return None
+  folder_files = _planner_external_files_by_folder(row.get("external_files") or []).get(folder_name, [])
+  return folder_files[0] if folder_files else None
+
+
+def _planner_existing_score_columns(selected_results: list[dict]) -> list[str]:
+  labels = {
+    str(item.get("label") or "").strip()
+    for row in selected_results
+    for item in row.get("existing_items") or []
+    if str(item.get("label") or "").strip()
+  }
+  return sorted(labels, key=lambda label: (PLANNER_EXISTING_PRIORITY.get(label, 999), label.lower()))
+
+
+def _planner_unique_archive_path(base_folder: str, filename: str, used_names: set[str]) -> str:
+  candidate = f"{base_folder}/{filename}" if base_folder else filename
+  if candidate not in used_names:
+    used_names.add(candidate)
+    return candidate
+
+  stem, suffix = os.path.splitext(filename)
+  index = 2
+  while True:
+    candidate = f"{base_folder}/{stem}_{index}{suffix}" if base_folder else f"{stem}_{index}{suffix}"
+    if candidate not in used_names:
+      used_names.add(candidate)
+      return candidate
+    index += 1
+
+
+def _planner_pdf_bytes_for_item(class_code: str, student_email: str, item: dict, raw_by_quiz: dict) -> bytes | None:
+  quiz_codes = [str(code).strip() for code in (item.get("source_quiz_codes") or []) if str(code).strip()]
+  if not class_code or not student_email or not quiz_codes:
+    return None
+
+  for quiz_code in quiz_codes:
+    if quiz_code not in raw_by_quiz:
+      raw_by_quiz[quiz_code] = fetch_grades(class_code, quiz_code, include_questions=True).get("attempts", [])
+
+  if len(quiz_codes) == 1:
+    quiz_code = quiz_codes[0]
+    attempts_raw = [
+      attempt for attempt in raw_by_quiz.get(quiz_code, [])
+      if (attempt.get("student_email") or "").strip().lower() == student_email.lower()
+    ]
+    enriched = [_normalise_attempt_questions(attempt) for attempt in attempts_raw]
+    if not enriched:
+      return None
+    candidate_map = _build_candidate_map([attempt.get("student_email", "") for attempt in enriched])
+    pdf_buf = generate_pdf(class_code, quiz_code, enriched, candidate_map, **_pdf_request_options({}))
+    return pdf_buf.getvalue()
+
+  best_attempts = build_student_best_attempt_map({quiz_code: raw_by_quiz.get(quiz_code, []) for quiz_code in quiz_codes})
+  merged_attempts, eligible_emails = build_merged_pdf_attempts(best_attempts, quiz_codes, student_email.lower())
+  if not merged_attempts:
+    return None
+  candidate_map = _build_candidate_map(eligible_emails)
+  pdf_buf = generate_pdf(class_code, "evidence", merged_attempts, candidate_map, **_pdf_request_options({}))
+  return pdf_buf.getvalue()
+
+
+def _planner_build_manifest_csv(manifest_rows: list[dict], score_columns: list[str], include_all_files: bool) -> str:
+  max_other_files = max((len(row.get("other_files") or []) for row in manifest_rows), default=0)
+  fieldnames = [
+    "Student",
+    "Candidate #",
+    "Email",
+    "Folder",
+    "Likely %",
+    "Likely Grade",
+    "Existing-only %",
+    "Existing-only Grade",
+    "Missing Evidence Pieces",
+  ]
+  for index in range(1, 4):
+    fieldnames.extend([
+      f"Evidence {index} Label",
+      f"Evidence {index} Score",
+      f"Evidence {index} Grade",
+      f"Evidence {index} Path",
+    ])
+  for label in score_columns:
+    fieldnames.append(f"{label} Score")
+    fieldnames.append(f"{label} Grade")
+  if include_all_files:
+    for index in range(1, max_other_files + 1):
+      fieldnames.append(f"Other File {index}")
+
+  output = io.StringIO()
+  writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+  writer.writeheader()
+  for row in manifest_rows:
+    writer.writerow(row)
+  return output.getvalue()
+
+
+def _planner_build_export_zip(planner_data: dict, include_all_files: bool, flatten_folders: bool = False) -> io.BytesIO:
+  selected_results = planner_data.get("selected_results") or []
+  class_code = str(planner_data.get("class_code") or "").strip()
+  raw_by_quiz = dict(planner_data.get("raw_by_quiz") or {})
+  score_columns = _planner_existing_score_columns(selected_results)
+  manifest_rows = []
+
+  zip_buf = io.BytesIO()
+  with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    manifest_name = "index.csv" if flatten_folders else "evidence_manifest.csv"
+    for row in selected_results:
+      student_folder = _planner_student_folder_name(row.get("display_name", "student"), row.get("candidate_no", ""))
+      archive_base = "" if flatten_folders else student_folder
+      used_external_paths = set()
+      used_archive_names = set()
+      evidence_entries = []
+
+      for index, item in enumerate(row.get("best_available") or [], start=1):
+        relative_export_path = ""
+        label = str(item.get("label") or f"Evidence {index}").strip()
+        score_value = item.get("avg_percentage")
+        score_text = f"{score_value:.1f}%" if score_value is not None else ""
+        grade_text = str(item.get("grade") or "")
+        archive_path = ""
+
+        if item.get("source") == "csv":
+          file_info = _planner_existing_file_info(row, label)
+          if file_info:
+            source_path = resolve_external_evidence_file(row.get("candidate_no", ""), file_info.get("relative_path", ""))
+            if source_path:
+              export_name = os.path.basename(file_info.get("relative_path", "")) or os.path.basename(source_path)
+              archive_path = _planner_unique_archive_path(archive_base, export_name, used_archive_names)
+              archive.write(source_path, archive_path)
+              relative_export_path = archive_path
+              used_external_paths.add(file_info.get("relative_path", ""))
+        else:
+          pdf_bytes = _planner_pdf_bytes_for_item(class_code, row.get("email", ""), item, raw_by_quiz)
+          if pdf_bytes:
+            if len(item.get("source_quiz_codes") or []) == 1:
+              export_name = f"{_ascii_safe_slug(item['source_quiz_codes'][0], 'quiz')}.pdf"
+            else:
+              export_name = f"{_ascii_safe_slug(label, 'merged_assessment')}.pdf"
+            archive_path = _planner_unique_archive_path(archive_base, export_name, used_archive_names)
+            archive.writestr(archive_path, pdf_bytes)
+            relative_export_path = archive_path
+
+        evidence_entries.append({
+          "label": label,
+          "score": score_text,
+          "grade": grade_text,
+          "path": relative_export_path,
+        })
+
+      other_files = []
+      if include_all_files:
+        for extra_index, file_info in enumerate(row.get("external_files") or [], start=1):
+          relative_path = str(file_info.get("relative_path") or "")
+          if not relative_path or relative_path in used_external_paths:
+            continue
+          source_path = resolve_external_evidence_file(row.get("candidate_no", ""), relative_path)
+          if not source_path:
+            continue
+          export_name = os.path.basename(relative_path)
+          archive_path = _planner_unique_archive_path(archive_base, export_name, used_archive_names)
+          archive.write(source_path, archive_path)
+          other_files.append(archive_path)
+
+      manifest_row = {
+        "Student": row.get("display_name", ""),
+        "Candidate #": row.get("candidate_no", ""),
+        "Email": row.get("email", ""),
+        "Folder": student_folder,
+        "Likely %": f"{row['best_prediction']['percentage']:.1f}%" if row.get("best_prediction", {}).get("percentage") is not None else "",
+        "Likely Grade": row.get("best_prediction", {}).get("grade", ""),
+        "Existing-only %": f"{row['current_prediction']['percentage']:.1f}%" if row.get("current_prediction", {}).get("percentage") is not None else "",
+        "Existing-only Grade": row.get("current_prediction", {}).get("grade", ""),
+        "Missing Evidence Pieces": row.get("missing_evidence_count", 0),
+        "other_files": other_files,
+      }
+      for index in range(1, 4):
+        entry = evidence_entries[index - 1] if index - 1 < len(evidence_entries) else {}
+        manifest_row[f"Evidence {index} Label"] = entry.get("label", "")
+        manifest_row[f"Evidence {index} Score"] = entry.get("score", "")
+        manifest_row[f"Evidence {index} Grade"] = entry.get("grade", "")
+        manifest_row[f"Evidence {index} Path"] = entry.get("path", "")
+
+      existing_scores = {str(item.get("label") or "").strip(): item for item in row.get("existing_items") or []}
+      for label in score_columns:
+        score_item = existing_scores.get(label)
+        manifest_row[f"{label} Score"] = score_item.get("display", "") if score_item else ""
+        manifest_row[f"{label} Grade"] = score_item.get("grade_label", "") if score_item else ""
+
+      if include_all_files:
+        for index, other_path in enumerate(other_files, start=1):
+          manifest_row[f"Other File {index}"] = other_path
+      manifest_rows.append(manifest_row)
+
+    manifest_csv = _planner_build_manifest_csv(manifest_rows, score_columns, include_all_files)
+    archive.writestr(manifest_name, manifest_csv)
+    if flatten_folders and manifest_name != "evidence_manifest.csv":
+      archive.writestr("evidence_manifest.csv", manifest_csv)
+
+  zip_buf.seek(0)
+  return zip_buf
+
+
+def build_evidence_planner_view_data(
+  class_code: str,
+  quiz_codes_raw: str,
+  merge_groups_raw: str,
+  show_done: bool,
+  selected_candidate_nos: list[str],
+) -> dict:
+  quiz_codes = parse_code_list(quiz_codes_raw)
+  evidence_rows = load_existing_evidence_rows()
+  external_files_by_candidate = build_external_evidence_index([row["candidate_no"] for row in evidence_rows])
+  evidence_rows = append_pdf_only_existing_evidence(evidence_rows, external_files_by_candidate)
+  candidate_map = lookup_candidates_by_candidate_numbers([row["candidate_no"] for row in evidence_rows])
+  planner_state = load_planner_student_state([row["candidate_no"] for row in evidence_rows])
+
+  students = []
+  for row in evidence_rows:
+    candidate = candidate_map.get(row["candidate_no"], {})
+    state = planner_state.get(row["candidate_no"], {})
+    display_name = f"{candidate.get('forename', '')} {candidate.get('surname', '')}".strip() or row["student_name"]
+    students.append({
+      **row,
+      "display_name": display_name,
+      "email": candidate.get("email", ""),
+      "try_quiz_fit": bool(state.get("try_quiz_fit")),
+      "is_done": bool(state.get("is_done")),
+      "excluded_existing_labels": list(state.get("excluded_existing_labels", [])),
+      "excluded_quiz_codes": list(state.get("excluded_quiz_codes", [])),
+      "saved_quiz_codes": list(state.get("saved_quiz_codes", [])),
+      "saved_quiz_label": str(state.get("saved_quiz_label", "") or "").strip(),
+      "external_files": external_files_by_candidate.get(row["candidate_no"], []),
+    })
+
+  students = sorted(students, key=lambda student: (student["is_done"], student["display_name"].lower(), student["candidate_no"]))
+  visible_students = [student for student in students if show_done or not student["is_done"]]
+
+  if selected_candidate_nos:
+    selected_set = set(selected_candidate_nos)
+  else:
+    selected_set = {student["candidate_no"] for student in visible_students}
+
+  for student in students:
+    student["selected"] = student["candidate_no"] in selected_set
+
+  selected_results = []
+  error = None
+  merge_groups = parse_merge_groups(merge_groups_raw, quiz_codes)
+  live_quiz_count = 0
+  raw_by_quiz = {}
+
+  if class_code or quiz_codes_raw or selected_candidate_nos:
+    if not class_code:
+      error = "Enter a class code."
+    elif not selected_candidate_nos:
+      error = "Select at least one student."
+    else:
+      try:
+        if quiz_codes:
+          raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
+          live_quiz_infos = _summaries_from_groups(raw_by_quiz)
+        else:
+          live_quiz_infos, raw_by_quiz = discover_quiz_summaries(class_code)
+
+        student_score_map = build_student_quiz_score_map(raw_by_quiz)
+        excluded_quiz_codes = {code.lower() for code in CSV_EVIDENCE_QUIZ_CODE_MAP.values()}
+        live_quiz_count = sum(
+          1
+          for info in live_quiz_infos
+          if str(info.get("quiz_code") or "").strip().lower() not in excluded_quiz_codes
+        )
+
+        for student in students:
+          if not student["selected"]:
+            continue
+          email = (student.get("email") or "").lower()
+          score_map = student_score_map.get(email, {}) if email else {}
+          existing_candidates = build_existing_evidence_candidates(student["existing_items"])
+          filtered_existing_candidates = filter_existing_candidates(
+            existing_candidates,
+            set(student.get("excluded_existing_labels") or []),
+          )
+          student_excluded_quiz_codes = set(student.get("excluded_quiz_codes") or [])
+          merged_quiz_candidates = build_planner_merged_candidates(
+            score_map,
+            merge_groups,
+            excluded_quiz_codes=excluded_quiz_codes | student_excluded_quiz_codes,
+          )
+          saved_combo_candidate = build_saved_combo_candidate(
+            score_map,
+            student.get("saved_quiz_codes") or [],
+            student.get("saved_quiz_label", ""),
+            excluded_quiz_codes=excluded_quiz_codes | student_excluded_quiz_codes,
+          )
+          replacement_candidates = list(merged_quiz_candidates)
+          if saved_combo_candidate is not None:
+            saved_key = tuple(saved_combo_candidate.get("source_quiz_codes") or [])
+            existing_keys = {tuple(item.get("source_quiz_codes") or []) for item in replacement_candidates}
+            if saved_key not in existing_keys:
+              replacement_candidates.insert(0, saved_combo_candidate)
+          current_best = choose_preferred_existing_evidence(filtered_existing_candidates, top_n=3)
+          current_prediction = summarise_evidence_prediction(current_best)
+          better_quiz_options = (
+            find_better_quiz_evidence(filtered_existing_candidates, replacement_candidates, top_n=3)
+            if replacement_candidates and (student["try_quiz_fit"] or len(filtered_existing_candidates) < 3)
+            else []
+          )
+          best_available = choose_planner_best_available(
+            existing_candidates,
+            replacement_candidates,
+            try_quiz_fit=student["try_quiz_fit"],
+            excluded_existing_labels=set(student.get("excluded_existing_labels") or []),
+            excluded_quiz_codes=student_excluded_quiz_codes,
+            top_n=3,
+          )
+          best_prediction = summarise_evidence_prediction(best_available)
+          improvement = None
+          missing_evidence_count = max(0, 3 - len(best_available))
+          if current_prediction["percentage"] is not None and best_prediction["percentage"] is not None:
+            improvement = best_prediction["percentage"] - current_prediction["percentage"]
+
+          selected_results.append({
+            "candidate_no": student["candidate_no"],
+            "display_name": student["display_name"],
+            "email": student["email"],
+            "try_quiz_fit": student["try_quiz_fit"],
+            "is_done": student["is_done"],
+            "excluded_existing_labels": list(student.get("excluded_existing_labels") or []),
+            "excluded_quiz_codes": list(student.get("excluded_quiz_codes") or []),
+            "saved_quiz_codes": list(student.get("saved_quiz_codes") or []),
+            "saved_quiz_label": str(student.get("saved_quiz_label", "") or "").strip(),
+            "existing_items": student["existing_items"],
+            "better_quiz_options": better_quiz_options,
+            "best_available": best_available,
+            "current_prediction": current_prediction,
+            "best_prediction": best_prediction,
+            "improvement": improvement,
+            "missing_evidence_count": missing_evidence_count,
+            "has_missing_evidence": missing_evidence_count > 0,
+            "external_files": student.get("external_files", []),
+            "quiz_scores": [
+              {
+                **score_map.get(quiz_code, {"percentage": None, "minutes": None}),
+                "quiz_code": quiz_code,
+                "source_quiz_codes": [quiz_code],
+                "excluded": quiz_code in set(student.get("excluded_quiz_codes") or []),
+              }
+              for quiz_code in quiz_codes
+            ],
+            "merged_scores": [
+              {
+                **cell,
+                "excluded": bool(set(cell.get("source_quiz_codes") or []).intersection(set(student.get("excluded_quiz_codes") or []))),
+              }
+              for cell in build_merged_score_rows(score_map, merge_groups)
+            ],
+          })
+      except requests.HTTPError as e:
+        body = {}
+        try:
+          body = e.response.json()
+        except Exception:
+          pass
+        error = f"API error {e.response.status_code}: {body.get('error', str(e))}"
+      except requests.RequestException as e:
+        error = f"Request failed: {e}"
+      except Exception as e:
+        error = f"Error: {e}"
+
+  return {
+    "class_code": class_code,
+    "quiz_codes": quiz_codes,
+    "quiz_codes_raw": quiz_codes_raw,
+    "merge_groups": merge_groups,
+    "merge_groups_raw": merge_groups_raw,
+    "students": students,
+    "visible_students": visible_students,
+    "show_done": show_done,
+    "selected_candidate_nos": sorted(selected_set),
+    "selected_results": selected_results,
+    "error": error,
+    "live_quiz_count": live_quiz_count,
+    "raw_by_quiz": raw_by_quiz,
+  }
 
 
 def attempt_percentage(attempt: dict) -> float | None:
@@ -355,6 +995,193 @@ def choose_top_evidence_pieces(candidates: list[dict], top_n: int = 3) -> list[d
   return chosen
 
 
+def _planner_existing_priority(item: dict) -> int:
+  label = str(item.get("label") or "").strip()
+  return PLANNER_EXISTING_PRIORITY.get(label, len(PLANNER_EXISTING_PRIORITY))
+
+
+def choose_preferred_existing_evidence(existing_candidates: list[dict], top_n: int = 3) -> list[dict]:
+  return sorted(
+    existing_candidates,
+    key=lambda item: (
+      _planner_existing_priority(item),
+      -((item.get("avg_percentage") or -1)),
+      item.get("label") or "",
+    ),
+  )[:top_n]
+
+
+def filter_existing_candidates(existing_candidates: list[dict], excluded_labels: set[str] | None = None) -> list[dict]:
+  excluded = {str(label).strip() for label in (excluded_labels or set()) if str(label).strip()}
+  if not excluded:
+    return list(existing_candidates)
+  return [item for item in existing_candidates if str(item.get("label") or "").strip() not in excluded]
+
+
+def filter_quiz_candidates(quiz_candidates: list[dict], excluded_quiz_codes: set[str] | None = None) -> list[dict]:
+  excluded = {str(code).strip() for code in (excluded_quiz_codes or set()) if str(code).strip()}
+  if not excluded:
+    return list(quiz_candidates)
+  return [
+    item for item in quiz_candidates
+    if not excluded.intersection({str(code).strip() for code in (item.get("source_quiz_codes") or [])})
+  ]
+
+
+def build_planner_merged_candidates(
+  score_map: dict,
+  merge_groups: list,
+  excluded_quiz_codes: set[str] | None = None,
+  target_min: int = PLANNER_TARGET_MINUTES,
+  target_max: int = PLANNER_TARGET_MAX_MINUTES,
+) -> list[dict]:
+  candidates = []
+  excluded = {str(code).strip() for code in (excluded_quiz_codes or set()) if str(code).strip()}
+  seen = set()
+  for group in merge_groups:
+    group_codes = [str(code).strip() for code in group.get("quiz_codes", []) if str(code).strip()]
+    if len(group_codes) < 2:
+      continue
+    if excluded.intersection(group_codes):
+      continue
+    items = [score_map.get(quiz_code) for quiz_code in group_codes]
+    if any(item is None or item.get("percentage") is None for item in items):
+      continue
+    candidate = _planner_candidate_from_items(items, target_min=target_min, target_max=target_max, source="quiz")
+    if candidate is None:
+      continue
+    key = tuple(candidate.get("source_quiz_codes") or [])
+    if key in seen:
+      continue
+    seen.add(key)
+    candidate["label"] = group.get("label") or candidate.get("label")
+    candidate["linked_reason"] = group.get("source_label") or candidate.get("linked_reason")
+    candidate["is_merge_group"] = True
+    candidates.append(candidate)
+  return choose_top_evidence_pieces(candidates, top_n=max(len(candidates), 1))
+
+
+def build_saved_combo_candidate(
+  score_map: dict,
+  saved_quiz_codes: list[str] | None,
+  saved_quiz_label: str = "",
+  excluded_quiz_codes: set[str] | None = None,
+  target_min: int = PLANNER_TARGET_MINUTES,
+  target_max: int = PLANNER_TARGET_MAX_MINUTES,
+) -> dict | None:
+  saved_codes = [str(code).strip() for code in (saved_quiz_codes or []) if str(code).strip()]
+  if not saved_codes:
+    return None
+  excluded = {str(code).strip() for code in (excluded_quiz_codes or set()) if str(code).strip()}
+  if excluded.intersection(saved_codes):
+    return None
+  items = [score_map.get(quiz_code) for quiz_code in saved_codes]
+  if any(item is None or item.get("percentage") is None for item in items):
+    return None
+  candidate = _planner_candidate_from_items(items, target_min=target_min, target_max=target_max, source="quiz")
+  if candidate is None:
+    return None
+  candidate["label"] = saved_quiz_label or candidate.get("label")
+  candidate["linked_reason"] = "Saved quiz combination"
+  candidate["is_saved_combo"] = True
+  return candidate
+
+
+def _planner_selected_order(item: dict) -> tuple:
+  if item.get("source") == "csv":
+    return (
+      0,
+      _planner_existing_priority(item),
+      item.get("label") or "",
+    )
+  return (
+    1,
+    -((item.get("avg_percentage") or -1)),
+    item.get("label") or "",
+  )
+
+
+def _planner_replace_order(item: dict) -> tuple:
+  if item.get("source") == "csv":
+    return (
+      1,
+      _planner_existing_priority(item),
+      -((item.get("avg_percentage") or -1)),
+      -((item.get("score") or -1)),
+    )
+  return (
+    2,
+    0,
+    -((item.get("avg_percentage") or -1)),
+    -((item.get("score") or -1)),
+  )
+
+
+def choose_planner_best_available(
+  existing_candidates: list[dict],
+  quiz_candidates: list[dict],
+  try_quiz_fit: bool,
+  excluded_existing_labels: set[str] | None = None,
+  excluded_quiz_codes: set[str] | None = None,
+  top_n: int = 3,
+) -> list[dict]:
+  filtered_existing = filter_existing_candidates(existing_candidates, excluded_existing_labels)
+  filtered_quizzes = filter_quiz_candidates(quiz_candidates, excluded_quiz_codes)
+  selection = list(choose_preferred_existing_evidence(filtered_existing, top_n=top_n))
+  must_fill_gaps = len(selection) < top_n
+  excluded_existing = [
+    item for item in existing_candidates
+    if str(item.get("label") or "").strip() in {str(label).strip() for label in (excluded_existing_labels or set()) if str(label).strip()}
+  ]
+  excluded_thresholds = sorted([
+    item.get("avg_percentage")
+    for item in excluded_existing
+    if item.get("avg_percentage") is not None
+  ])
+  if not try_quiz_fit and not must_fill_gaps:
+    return sorted(selection, key=_planner_selected_order)
+
+  for quiz_candidate in choose_top_evidence_pieces(filtered_quizzes, top_n=max(top_n * 3, 6)):
+    quiz_sources = set(quiz_candidate.get("source_quiz_codes") or [])
+    if len(selection) < top_n:
+      used_sources = {
+        source_code
+        for item in selection
+        for source_code in (item.get("source_quiz_codes") or [])
+      }
+      if not used_sources & quiz_sources:
+        threshold_index = len(selection) - len(choose_preferred_existing_evidence(filtered_existing, top_n=top_n))
+        required_threshold = excluded_thresholds[threshold_index] if 0 <= threshold_index < len(excluded_thresholds) else None
+        quiz_percentage = quiz_candidate.get("avg_percentage")
+        if quiz_candidate.get("is_saved_combo") or required_threshold is None or (quiz_percentage is not None and quiz_percentage > required_threshold + 0.05):
+          selection.append(quiz_candidate)
+      continue
+
+    quiz_percentage = quiz_candidate.get("avg_percentage")
+    if quiz_percentage is None:
+      continue
+
+    replacement_index = None
+    for index, current in sorted(enumerate(selection), key=lambda pair: _planner_replace_order(pair[1]), reverse=True):
+      remaining_sources = {
+        source_code
+        for current_index, item in enumerate(selection)
+        if current_index != index
+        for source_code in (item.get("source_quiz_codes") or [])
+      }
+      if remaining_sources & quiz_sources:
+        continue
+      current_percentage = current.get("avg_percentage")
+      if current_percentage is None or quiz_percentage > current_percentage + 0.05:
+        replacement_index = index
+        break
+
+    if replacement_index is not None:
+      selection[replacement_index] = quiz_candidate
+
+  return sorted(selection, key=_planner_selected_order)
+
+
 def build_planner_quiz_candidates(
   score_map: dict,
   excluded_quiz_codes: set[str] | None = None,
@@ -434,7 +1261,7 @@ def summarise_evidence_prediction(evidence_items: list[dict]) -> dict:
 
 
 def find_better_quiz_evidence(existing_candidates: list[dict], quiz_candidates: list[dict], top_n: int = 3) -> list[dict]:
-  current_best = choose_top_evidence_pieces(existing_candidates, top_n=3)
+  current_best = choose_preferred_existing_evidence(existing_candidates, top_n=3)
   current_percentages = [item.get("avg_percentage") for item in current_best if item.get("avg_percentage") is not None]
   if len(current_percentages) < 3:
     return choose_top_evidence_pieces(quiz_candidates, top_n=top_n)
@@ -641,6 +1468,7 @@ def build_merged_score_rows(score_map: dict, merge_groups: list) -> list:
         "percentage": None,
         "total_minutes": None,
         "missing": group["unknown_codes"],
+        "source_quiz_codes": group["quiz_codes"],
       })
       continue
 
@@ -657,6 +1485,7 @@ def build_merged_score_rows(score_map: dict, merge_groups: list) -> list:
         "percentage": None,
         "total_minutes": None,
         "missing": missing,
+        "source_quiz_codes": group["quiz_codes"],
       })
       continue
 
@@ -673,6 +1502,7 @@ def build_merged_score_rows(score_map: dict, merge_groups: list) -> list:
       "attempted_questions": sum(item.get("attempted_questions") or 0 for item in components),
       "total_questions": sum(item.get("total_questions") or 0 for item in components),
       "missing": [],
+      "source_quiz_codes": group["quiz_codes"],
     })
   return merged_rows
 
@@ -1173,21 +2003,40 @@ BASE_STYLE = """
   .grade-? { background: #9ca3af; color: #fff; }
 
   .student-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: .8rem; max-height: 420px; overflow-y: auto; padding: .2rem; }
-  .student-option { display: block; border: 1px solid #dbe3f0; border-radius: 10px; background: #f8fbff; padding: .85rem; cursor: pointer; }
+  .student-option { display: block; border: 1px solid #dbe3f0; border-radius: 10px; background: #f8fbff; padding: .85rem; }
   .student-option:hover { border-color: #93c5fd; background: #f0f7ff; }
   .student-option input { margin-right: .45rem; }
+  .student-option.done { background: #f8fafc; border-color: #cbd5e1; }
   .student-name { font-weight: 700; color: #0f3460; }
   .student-meta { display: block; color: #64748b; font-size: .8rem; margin-top: .2rem; }
   .student-tags { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
+  .student-controls { display: flex; flex-wrap: wrap; gap: .8rem; margin-top: .75rem; padding-top: .65rem; border-top: 1px solid #dbe3f0; }
+  .student-control { display: flex; align-items: center; gap: .35rem; font-size: .8rem; font-weight: 600; color: #334155; }
+  .student-existing-exclusions { margin-top: .65rem; padding-top: .65rem; border-top: 1px dashed #dbe3f0; }
+  .student-existing-exclusions .student-control { margin-top: .35rem; }
+  .student-file-list { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .65rem; }
+  .student-file-link { display: inline-flex; align-items: center; gap: .35rem; padding: .2rem .55rem; border-radius: 999px; background: #eff6ff; color: #1d4ed8; font-size: .75rem; font-weight: 600; text-decoration: none; }
+  .student-file-link:hover { background: #dbeafe; }
+  .toggle-chip-form { margin: 0 0 .35rem 0; }
+  .toggle-chip-btn { width: 100%; text-align: left; border: none; cursor: pointer; }
+  .toggle-chip-btn.is-excluded { opacity: .45; filter: grayscale(1); }
+  .toggle-cell-btn { width: 100%; border: 1px solid #dbe3f0; border-radius: 10px; background: #fff; padding: .55rem .65rem; text-align: left; cursor: pointer; }
+  .toggle-cell-btn.is-excluded { background: #f1f5f9; color: #64748b; opacity: .6; }
+  .toggle-cell-btn:hover { border-color: #93c5fd; }
   .score-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .2rem .55rem; border-radius: 999px; font-size: .75rem; font-weight: 600; }
   .score-chip-existing { background: #eef2ff; color: #3730a3; }
   .score-chip-live { background: #ecfdf5; color: #065f46; }
   .score-chip-merge { background: #fff7ed; color: #9a3412; }
+  .score-chip-done { background: #ecfeff; color: #155e75; }
+  .score-chip-warning { background: #fef2f2; color: #b91c1c; }
   .score-cell { min-width: 150px; }
   .score-main { font-size: 1rem; font-weight: 800; color: #0f3460; }
   .score-sub { color: #64748b; font-size: .8rem; margin-top: .2rem; }
   .soft-btn { background: #e2e8f0; color: #0f172a; }
   .soft-btn:hover { background: #cbd5e1; }
+  .planner-actions { width: 100%; display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+  .planner-filter { display: flex; align-items: center; gap: .45rem; font-size: .85rem; font-weight: 600; color: #334155; }
+  .planner-mini-form { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .35rem; }
 </style>
 """
 
@@ -1279,10 +2128,10 @@ INDEX_TEMPLATE = BASE_STYLE + """
         </label>
         <div class="section-title" style="margin-top:1rem">Page margins (mm)</div>
         <label>Top / Bottom
-          <input type="number" name="margin_tb" value="15" min="5" max="50">
+          <input type="number" name="margin_tb" value="8" min="5" max="50">
         </label>
         <label style="margin-top:.5rem">Left / Right
-          <input type="number" name="margin_lr" value="15" min="5" max="50">
+          <input type="number" name="margin_lr" value="8" min="5" max="50">
         </label>
       </div>
 
@@ -1294,12 +2143,15 @@ INDEX_TEMPLATE = BASE_STYLE + """
         <label style="margin-top:.5rem">Crop top of image
           <select name="img_crop_pct">
             <option value="0">None (0%)</option>
-            <option value="2">2%</option>
-            <option value="3" selected>3% (default)</option>
+            <option value="2" selected>2% (default)</option>
+            <option value="3">3%</option>
             <option value="5">5%</option>
             <option value="10">10%</option>
             <option value="15">15%</option>
           </select>
+        </label>
+        <label style="margin-top:.5rem">Extra top crop (px)
+          <input type="number" name="img_crop_px" value="0" min="0" max="200">
         </label>
         <label style="margin-top:.5rem">Page break between students?
           <select name="page_break">
@@ -1396,8 +2248,8 @@ PDF_OPTIONS_PARTIAL = """
       <input type="text" name="centre_number" value="" placeholder="optional override">
     </label>
     <div class="section-title" style="margin-top:1rem">Page margins (mm)</div>
-    <label>Top / Bottom <input type="number" name="margin_tb" value="15" min="5" max="50"></label>
-    <label style="margin-top:.5rem">Left / Right <input type="number" name="margin_lr" value="15" min="5" max="50"></label>
+    <label>Top / Bottom <input type="number" name="margin_tb" value="8" min="5" max="50"></label>
+    <label style="margin-top:.5rem">Left / Right <input type="number" name="margin_lr" value="8" min="5" max="50"></label>
   </div>
   <div>
     <div class="section-title">Image-only responses</div>
@@ -1405,12 +2257,15 @@ PDF_OPTIONS_PARTIAL = """
     <label style="margin-top:.5rem">Crop top of image
       <select name="img_crop_pct">
         <option value="0">None (0%)</option>
-        <option value="2">2%</option>
-        <option value="3" selected>3% (default)</option>
+        <option value="2" selected>2% (default)</option>
+        <option value="3">3%</option>
         <option value="5">5%</option>
         <option value="10">10%</option>
         <option value="15">15%</option>
       </select>
+    </label>
+    <label style="margin-top:.5rem">Extra top crop (px)
+      <input type="number" name="img_crop_px" value="0" min="0" max="200">
     </label>
     <label style="margin-top:.5rem">Page break between students?
       <select name="page_break">
@@ -1730,6 +2585,14 @@ EVIDENCE_TEMPLATE = BASE_STYLE + """
 """
 
 PLANNER_TEMPLATE = BASE_STYLE + """
+{% macro render_planner_context() -%}
+  <input type="hidden" name="class_code" value="{{ class_code }}">
+  <input type="hidden" name="quiz_codes" value="{{ quiz_codes_raw }}">
+  <input type="hidden" name="merge_groups" value="{{ merge_groups_raw }}">
+  {% if show_done %}<input type="hidden" name="show_done" value="1">{% endif %}
+  {% for candidate_no in selected_candidate_nos %}<input type="hidden" name="selected_candidate" value="{{ candidate_no }}">{% endfor %}
+{%- endmacro %}
+
 <h1>Grade Viewer</h1>
 
 <nav class="tabs">
@@ -1742,10 +2605,10 @@ PLANNER_TEMPLATE = BASE_STYLE + """
   <h2>Evidence Planner</h2>
   <p class="info" style="margin-bottom:1rem">
     This page uses the existing evidence file <strong>y11scores.csv</strong>. Each CSV score is treated as
-    a standalone 60+ minute evidence piece. Enter a class code, optionally add quiz codes, and the planner
-    will look for stronger live quiz evidence while excluding <strong>april30mock</strong>, which is already
-    represented in the CSV. Linked live evidence is limited to quizzes sat within roughly a week so you can
-    justify it as a short series of lessons.
+    a standalone 60+ minute evidence piece. The default order prefers existing evidence first, using
+    <strong>January Mock 2026</strong>, <strong>Year 10 EOY</strong>, <strong>April 30 Mock</strong>, then
+    <strong>Paper 2</strong>. Turn on <strong>Try better quiz fit</strong> for individual students when you
+    want the planner to look for stronger live quiz evidence.
   </p>
   <div style="display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:1rem">
     {% for band in grade_thresholds %}
@@ -1755,7 +2618,7 @@ PLANNER_TEMPLATE = BASE_STYLE + """
     </span>
     {% endfor %}
   </div>
-  <form method="get" action="/evidence/planner">
+  <form method="post" action="/evidence/planner">
     <label>Class Code
       <input type="text" name="class_code" value="{{ class_code }}" placeholder="e.g. oxaqa25" required>
     </label>
@@ -1765,18 +2628,30 @@ PLANNER_TEMPLATE = BASE_STYLE + """
     <label>Merged Quiz Groups
       <input type="text" name="merge_groups" value="{{ merge_groups_raw }}" placeholder="Q1+Q2; Q3+Q4" style="width:320px">
     </label>
-    <button type="submit" class="btn">Plan Evidence</button>
-    <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = true)">Select All</button>
-    <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = false)">Clear All</button>
+    <div class="planner-actions">
+      <button type="submit" class="btn">Update Planner</button>
+      <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = true)">Select Visible</button>
+      <button type="button" class="btn soft-btn" onclick="document.querySelectorAll('input[name=selected_candidate]').forEach(el => el.checked = false)">Clear Selection</button>
+      <label class="planner-filter">
+        <input type="checkbox" name="show_done" value="1" {% if show_done %}checked{% endif %}>
+        Show done students
+      </label>
+    </div>
 
     <div style="width:100%;margin-top:.8rem">
       <div class="section-title">Students</div>
+      <div class="info" style="margin-bottom:.65rem">
+        Active students shown: {{ visible_students|length }} of {{ students|length }}.
+        {% if not show_done %}Done students are hidden until you tick "Show done students".{% endif %}
+      </div>
       <div class="student-picker">
-        {% for student in students %}
-        <label class="student-option">
+        {% for student in visible_students %}
+        <div class="student-option {% if student.is_done %}done{% endif %}">
           <div>
             <input type="checkbox" name="selected_candidate" value="{{ student.candidate_no }}" {% if student.selected %}checked{% endif %}>
             <span class="student-name">{{ student.display_name }}</span>
+            {% if student.is_done %}<span class="score-chip score-chip-done">Done</span>{% endif %}
+            {% if student.try_quiz_fit %}<span class="score-chip score-chip-live">Quiz fit on</span>{% endif %}
           </div>
           <span class="student-meta">#{{ student.candidate_no }} · {{ student.evidence_count }} existing evidence piece{{ 's' if student.evidence_count != 1 else '' }}</span>
           {% if student.email %}<span class="student-meta">{{ student.email }}</span>{% endif %}
@@ -1785,7 +2660,24 @@ PLANNER_TEMPLATE = BASE_STYLE + """
             <span class="score-chip score-chip-existing">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</span>
             {% endfor %}
           </div>
-        </label>
+          <div class="student-controls">
+            <label class="student-control">
+              <input type="checkbox" name="try_quiz_fit_candidate" value="{{ student.candidate_no }}" {% if student.try_quiz_fit %}checked{% endif %}>
+              Try better quiz fit
+            </label>
+            <label class="student-control">
+              <input type="checkbox" name="done_candidate" value="{{ student.candidate_no }}" {% if student.is_done %}checked{% endif %}>
+              Done
+            </label>
+          </div>
+          {% if student.external_files %}
+          <div class="student-file-list">
+            {% for file in student.external_files %}
+            <a class="student-file-link" href="{{ file.open_url }}" target="_blank" rel="noopener noreferrer">{{ file.name }}</a>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
         {% endfor %}
       </div>
     </div>
@@ -1805,12 +2697,29 @@ PLANNER_TEMPLATE = BASE_STYLE + """
 </div>
 
 <div class="card">
+  <form method="get" action="/evidence/planner/export" style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
+    {{ render_planner_context() }}
+    <label class="planner-filter" style="margin:0">
+      <input type="checkbox" name="include_all_files" value="1">
+      Include all matched student files, not just Best Available 3
+    </label>
+    <label class="planner-filter" style="margin:0">
+      <input type="checkbox" name="flatten_folders" value="1">
+      Remove student folders and use index CSV to reference files
+    </label>
+    <button type="submit" class="btn btn-green">Download ZIP Export</button>
+  </form>
+</div>
+
+<div class="card">
   <div style="overflow-x:auto">
     <table>
       <thead>
         <tr>
           <th>Candidate #</th>
           <th>Student</th>
+          <th>Planner State</th>
+          <th>Files</th>
           <th>Existing Evidence</th>
           <th>Better Quiz Evidence</th>
           <th>Best Available 3</th>
@@ -1828,8 +2737,64 @@ PLANNER_TEMPLATE = BASE_STYLE + """
             {% if row.email %}<br><small style="color:#64748b">{{ row.email }}</small>{% endif %}
           </td>
           <td class="score-cell">
+            {% if row.try_quiz_fit %}
+            <div class="score-chip score-chip-live" style="margin-bottom:.35rem">Try better quiz fit</div>
+            {% else %}
+            <div class="score-chip score-chip-existing" style="margin-bottom:.35rem">Existing only</div>
+            {% endif %}
+            {% if row.is_done %}<div class="score-chip score-chip-done">Done</div>{% endif %}
+            {% if row.saved_quiz_codes %}
+            <div class="score-chip score-chip-live" style="margin-bottom:.35rem">Saved combo</div>
+            <div class="score-sub">{{ row.saved_quiz_label or row.saved_quiz_codes|join(', ') }}</div>
+            <div class="score-sub">Codes: {{ row.saved_quiz_codes|join(', ') }}</div>
+            <div class="planner-mini-form">
+              <form method="get" action="{% if row.saved_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" target="_blank">
+                <input type="hidden" name="class_code" value="{{ class_code }}">
+                <input type="hidden" name="student_email" value="{{ row.email }}">
+                <input type="hidden" name="inline" value="1">
+                {% if row.saved_quiz_codes|length > 1 %}
+                <input type="hidden" name="quiz_codes" value="{{ row.saved_quiz_codes|join(',') }}">
+                <input type="hidden" name="merged_name" value="{{ row.saved_quiz_label or row.saved_quiz_codes|join(', ') }}">
+                {% else %}
+                <input type="hidden" name="quiz_code" value="{{ row.saved_quiz_codes[0] }}">
+                {% endif %}
+                <button type="submit" class="btn btn-sm btn-green">Saved PDF</button>
+              </form>
+              <form method="post" action="/evidence/planner/save-combo">
+                {{ render_planner_context() }}
+                <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+                <input type="hidden" name="combo_action" value="clear">
+                <button type="submit" class="btn btn-sm soft-btn">Clear saved</button>
+              </form>
+            </div>
+            {% endif %}
+            {% for label in row.excluded_existing_labels %}
+            <div class="score-sub">Ignoring {{ label }}</div>
+            {% endfor %}
+            {% for code in row.excluded_quiz_codes %}
+            <div class="score-sub">Ignoring quiz {{ code }}</div>
+            {% endfor %}
+          </td>
+          <td class="score-cell">
+            {% if row.external_files %}
+              {% for file in row.external_files %}
+              <div style="margin-bottom:.35rem">
+                <a class="student-file-link" href="{{ file.open_url }}" target="_blank" rel="noopener noreferrer">{{ file.name }}</a>
+              </div>
+              {% endfor %}
+            {% else %}
+            <span class="no-data">No matched files</span>
+            {% endif %}
+          </td>
+          <td class="score-cell">
             {% for item in row.existing_items %}
-            <div class="score-chip score-chip-existing" style="margin-bottom:.35rem">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</div>
+            <form class="toggle-chip-form" method="post" action="/evidence/planner/toggle">
+              {{ render_planner_context() }}
+              <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+              <input type="hidden" name="toggle_type" value="existing">
+              <input type="hidden" name="toggle_values" value="{{ item.label }}">
+              <button type="submit" class="score-chip toggle-chip-btn {{ 'score-chip-merge is-excluded' if item.label in row.excluded_existing_labels else 'score-chip-existing' }}">{{ item.label }}: {{ item.display }} · {{ item.grade_label }}</button>
+            </form>
             {% endfor %}
             {% if not row.existing_items %}<span class="no-data">No existing evidence</span>{% endif %}
           </td>
@@ -1837,16 +2802,69 @@ PLANNER_TEMPLATE = BASE_STYLE + """
             {% for item in row.better_quiz_options %}
             <div class="score-chip score-chip-merge" style="margin-bottom:.35rem">{{ item.label }}: {{ "%.1f"|format(item.avg_percentage) }}% · {{ item.grade }}</div>
             <div class="score-sub">~{{ item.total_minutes }} min{% if item.date_span %} · {{ item.date_span }}{% endif %}</div>
-            {% if item.linked_reason %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            {% if item.is_saved_combo %}<div class="score-sub">Saved combo</div>
+            {% elif item.linked_reason %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            <div class="planner-mini-form">
+              <form method="get" action="{% if item.source_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" target="_blank">
+                <input type="hidden" name="class_code" value="{{ class_code }}">
+                <input type="hidden" name="student_email" value="{{ row.email }}">
+                <input type="hidden" name="inline" value="1">
+                {% if item.source_quiz_codes|length > 1 %}
+                <input type="hidden" name="quiz_codes" value="{{ item.source_quiz_codes|join(',') }}">
+                <input type="hidden" name="merged_name" value="{{ item.label }}">
+                {% else %}
+                <input type="hidden" name="quiz_code" value="{{ item.source_quiz_codes[0] }}">
+                {% endif %}
+                <button type="submit" class="btn btn-sm btn-green">View PDF</button>
+              </form>
+              <form method="post" action="/evidence/planner/save-combo">
+                {{ render_planner_context() }}
+                <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+                <input type="hidden" name="combo_action" value="save">
+                <input type="hidden" name="combo_codes" value="{{ item.source_quiz_codes|join(',') }}">
+                <input type="hidden" name="combo_label" value="{{ item.label }}">
+                <button type="submit" class="btn btn-sm soft-btn">Save combo</button>
+              </form>
+            </div>
             {% endfor %}
-            {% if not row.better_quiz_options %}<span class="no-data">No better linked quiz evidence found</span>{% endif %}
+            {% if not row.try_quiz_fit and not row.excluded_existing_labels %}<span class="no-data">Only merged groups or a saved combo can replace missing evidence.</span>
+            {% elif not row.better_quiz_options %}<span class="no-data">No merged-group replacement available for this student.</span>{% endif %}
           </td>
           <td class="score-cell">
             {% for item in row.best_available %}
             <div class="score-chip {{ 'score-chip-existing' if item.source == 'csv' else 'score-chip-merge' }}" style="margin-bottom:.35rem">{{ item.label }}: {{ "%.1f"|format(item.avg_percentage) }}% · {{ item.grade }}</div>
             <div class="score-sub">{% if item.source == 'csv' %}CSV evidence{% else %}~{{ item.total_minutes }} min{% if item.date_span %} · {{ item.date_span }}{% endif %}{% endif %}</div>
-            {% if item.linked_reason and item.source == 'quiz' %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            {% if item.is_saved_combo %}<div class="score-sub">Saved combo</div>
+            {% elif item.linked_reason and item.source == 'quiz' %}<div class="score-sub">{{ item.linked_reason }}</div>{% endif %}
+            {% if item.source == 'quiz' %}
+            <div class="planner-mini-form">
+              <form method="get" action="{% if item.source_quiz_codes|length > 1 %}/evidence/pdf/merged{% else %}/evidence/pdf{% endif %}" target="_blank">
+                <input type="hidden" name="class_code" value="{{ class_code }}">
+                <input type="hidden" name="student_email" value="{{ row.email }}">
+                <input type="hidden" name="inline" value="1">
+                {% if item.source_quiz_codes|length > 1 %}
+                <input type="hidden" name="quiz_codes" value="{{ item.source_quiz_codes|join(',') }}">
+                <input type="hidden" name="merged_name" value="{{ item.label }}">
+                {% else %}
+                <input type="hidden" name="quiz_code" value="{{ item.source_quiz_codes[0] }}">
+                {% endif %}
+                <button type="submit" class="btn btn-sm btn-green">View PDF</button>
+              </form>
+              <form method="post" action="/evidence/planner/save-combo">
+                {{ render_planner_context() }}
+                <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+                <input type="hidden" name="combo_action" value="save">
+                <input type="hidden" name="combo_codes" value="{{ item.source_quiz_codes|join(',') }}">
+                <input type="hidden" name="combo_label" value="{{ item.label }}">
+                <button type="submit" class="btn btn-sm soft-btn">Save combo</button>
+              </form>
+            </div>
+            {% endif %}
             {% endfor %}
+            {% if row.has_missing_evidence %}
+            <div class="score-chip score-chip-warning" style="margin-top:.35rem">Missing {{ row.missing_evidence_count }} evidence piece{{ 's' if row.missing_evidence_count != 1 else '' }}</div>
+            <div class="score-sub">No eligible merged-group replacement was available.</div>
+            {% endif %}
             {% if not row.best_available %}<span class="no-data">No evidence available</span>{% endif %}
           </td>
           <td class="score-cell">
@@ -1856,17 +2874,27 @@ PLANNER_TEMPLATE = BASE_STYLE + """
             <div class="score-chip" style="background:#f8fafc;border:1px solid #dbe3f0;color:#0f172a;margin-bottom:.35rem">
               <span class="grade-badge grade-{{ row.best_prediction.grade_class }}" style="margin-left:0">{{ row.best_prediction.grade }}</span>
             </div>
-            {% if row.current_prediction.percentage is not none %}<div class="score-sub">CSV-only best: {{ "%.1f"|format(row.current_prediction.percentage) }}%</div>{% endif %}
+            {% if row.current_prediction.percentage is not none %}<div class="score-sub">Existing-only best: {{ "%.1f"|format(row.current_prediction.percentage) }}%</div>{% endif %}
             {% if row.improvement is not none and row.improvement > 0.05 %}<div class="score-sub">Improvement: +{{ "%.1f"|format(row.improvement) }}%</div>{% endif %}
+            {% if row.has_missing_evidence %}<div class="score-chip score-chip-warning" style="margin-top:.35rem">Incomplete evidence set</div>{% endif %}
             {% else %}
             <span class="no-data">No evidence available</span>
+            {% if row.has_missing_evidence %}<div class="score-chip score-chip-warning" style="margin-top:.35rem">Missing {{ row.missing_evidence_count }} evidence piece{{ 's' if row.missing_evidence_count != 1 else '' }}</div>{% endif %}
             {% endif %}
           </td>
           {% for cell in row.quiz_scores %}
           <td class="score-cell">
             {% if cell.percentage is not none %}
-            <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
-            <div class="score-sub">~{{ cell.minutes }} min · {{ grade_of(cell.percentage) }}</div>
+            <form method="post" action="/evidence/planner/toggle">
+              {{ render_planner_context() }}
+              <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+              <input type="hidden" name="toggle_type" value="quiz">
+              <input type="hidden" name="toggle_values" value="{{ cell.quiz_code }}">
+              <button type="submit" class="toggle-cell-btn {{ 'is-excluded' if cell.excluded else '' }}">
+                <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
+                <div class="score-sub">{{ cell.quiz_code }} · ~{{ cell.minutes }} min · {{ grade_of(cell.percentage) }}</div>
+              </button>
+            </form>
             {% else %}
             <span class="no-data">—</span>
             {% endif %}
@@ -1875,14 +2903,24 @@ PLANNER_TEMPLATE = BASE_STYLE + """
           {% for cell in row.merged_scores %}
           <td class="score-cell">
             {% if cell.percentage is not none %}
-            <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
-            <div class="score-sub">~{{ cell.total_minutes }} min · {{ grade_of(cell.percentage) }}</div>
-            {% if cell.total_questions %}
-            <div class="score-sub">Attempted {{ cell.attempted_questions }}/{{ cell.total_questions }} questions ({{ "%.0f"|format((cell.attempted_questions / cell.total_questions) * 100) }}%)</div>
-            {% endif %}
-            <div class="score-chip score-chip-merge" style="margin-top:.35rem">{{ '1 hr+' if cell.total_minutes >= 60 else 'Under 1 hr' }}</div>
+            <form method="post" action="/evidence/planner/toggle">
+              {{ render_planner_context() }}
+              <input type="hidden" name="candidate_no" value="{{ row.candidate_no }}">
+              <input type="hidden" name="toggle_type" value="quiz">
+              <input type="hidden" name="toggle_values" value="{{ cell.source_quiz_codes|join(',') }}">
+              <button type="submit" class="toggle-cell-btn {{ 'is-excluded' if cell.excluded else '' }}">
+                <div class="score-main">{{ "%.1f"|format(cell.percentage) }}%</div>
+                <div class="score-sub">{{ cell.label }} · ~{{ cell.total_minutes }} min · {{ grade_of(cell.percentage) }}</div>
+                {% if cell.total_questions %}
+                <div class="score-sub">Attempted {{ cell.attempted_questions }}/{{ cell.total_questions }} questions ({{ "%.0f"|format((cell.attempted_questions / cell.total_questions) * 100) }}%)</div>
+                {% endif %}
+                <div class="score-chip score-chip-merge" style="margin-top:.35rem">{{ '1 hr+' if cell.total_minutes >= 60 else 'Under 1 hr' }}</div>
+              </button>
+            </form>
             {% elif cell.missing %}
-            <div class="score-sub">Missing: {{ cell.missing|join(', ') }}</div>
+            <button type="button" class="toggle-cell-btn is-excluded" disabled>
+              <div class="score-sub">Missing: {{ cell.missing|join(', ') }}</div>
+            </button>
             {% else %}
             <span class="no-data">—</span>
             {% endif %}
@@ -2041,6 +3079,7 @@ def _build_pdf_image(
   max_height: float,
   img_pct: float,
   crop_top_pct: float = 0.0,
+  crop_top_px: int = 0,
 ) -> RLImage | None:
   img_buf = _download_image(url)
   if not img_buf:
@@ -2049,10 +3088,9 @@ def _build_pdf_image(
   try:
     with PILImage.open(img_buf) as pil:
       image = PILImageOps.exif_transpose(pil)
-      if crop_top_pct > 0:
-        crop_pixels = int(image.height * (crop_top_pct / 100.0))
-        if 0 < crop_pixels < image.height:
-          image = image.crop((0, crop_pixels, image.width, image.height))
+      crop_pixels = int(image.height * (crop_top_pct / 100.0)) + max(0, int(crop_top_px))
+      if 0 < crop_pixels < image.height:
+        image = image.crop((0, crop_pixels, image.width, image.height))
 
       width, height = image.size
       if not width or not height:
@@ -2091,10 +3129,11 @@ def _pdf_request_options(args) -> dict:
     "inc_questions": arg_bool("inc_questions"),
     "inc_labels": arg_bool("inc_labels"),
     "centre_number": (args.get("centre_number", "") or "").strip(),
-    "margin_tb": arg_float("margin_tb", 15, 5, 50),
-    "margin_lr": arg_float("margin_lr", 15, 5, 50),
+    "margin_tb": arg_float("margin_tb", 8, 5, 50),
+    "margin_lr": arg_float("margin_lr", 8, 5, 50),
     "img_pct": arg_float("img_pct", 100, 30, 150),
-    "img_crop_pct": arg_float("img_crop_pct", 3, 0, 25),
+    "img_crop_pct": arg_float("img_crop_pct", 2, 0, 25),
+    "img_crop_px": int(arg_float("img_crop_px", 0, 0, 200)),
     "page_break_between": args.get("page_break", "1") == "1",
   }
 
@@ -2221,10 +3260,11 @@ def generate_pdf(
     inc_questions: bool = True,
     inc_labels: bool = True,
   centre_number: str = "",
-    margin_tb: float = 15,
-    margin_lr: float = 15,
+  margin_tb: float = 8,
+  margin_lr: float = 8,
     img_pct: float = 100,
-    img_crop_pct: float = 3.0,
+  img_crop_pct: float = 2.0,
+  img_crop_px: int = 0,
     page_break_between: bool = True,
     document_label: str | None = None,
 ) -> io.BytesIO:
@@ -2233,8 +3273,8 @@ def generate_pdf(
     page_w, page_h = A4
     usable_w = page_w - 2 * margin_lr * mm
     usable_h = page_h - 2 * margin_tb * mm
-    question_img_h = usable_h * 0.38
-    response_img_h = usable_h * 0.46
+    question_img_h = usable_h * 0.32
+    response_img_h = usable_h * 0.72
 
     doc = SimpleDocTemplate(
       buf,
@@ -2245,14 +3285,13 @@ def generate_pdf(
       rightMargin=margin_lr * mm,
     )
 
-    style_h1 = ParagraphStyle("H1", fontSize=14, fontName="Helvetica-Bold", spaceAfter=4, textColor=colors.HexColor("#0f3460"))
     style_h3 = ParagraphStyle("H3", fontSize=10, fontName="Helvetica-Bold", spaceAfter=2, textColor=colors.HexColor("#374151"))
     style_body = ParagraphStyle("Body", fontSize=9, fontName="Helvetica", spaceAfter=2, leading=13)
     style_small = ParagraphStyle("Small", fontSize=8, fontName="Helvetica", textColor=colors.HexColor("#6b7280"), spaceAfter=2)
     style_label = ParagraphStyle("Label", fontSize=8, fontName="Helvetica-Bold", textColor=colors.HexColor("#0f3460"))
     style_comment = ParagraphStyle("Cmt", fontSize=8, fontName="Helvetica-Oblique", textColor=colors.HexColor("#374151"), spaceAfter=2, leading=12)
 
-    story = [Paragraph("Evidence Pack", style_h1), HRFlowable(width="100%", thickness=1, color=colors.HexColor("#0f3460"), spaceAfter=6)]
+    story = []
 
     for idx, attempt in enumerate(attempts_data):
       email = attempt.get("student_email", "")
@@ -2305,7 +3344,10 @@ def generate_pdf(
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
       ]))
       story.append(KeepTogether([table]))
-      story.append(Spacer(1, 6 * mm))
+      if questions:
+        story.append(PageBreak())
+      else:
+        story.append(Spacer(1, 6 * mm))
 
       if not questions:
         story.append(Paragraph(
@@ -2359,6 +3401,7 @@ def generate_pdf(
             max_height=response_img_h,
             img_pct=img_pct,
             crop_top_pct=img_crop_pct,
+            crop_top_px=img_crop_px,
           )
           if response_image:
             question_block.append(response_image)
@@ -2375,8 +3418,9 @@ def generate_pdf(
           question_block.append(Spacer(1, 2 * mm))
           question_block.append(Paragraph(_pdf_text(f"Examiner comment: {comment}"), style_comment))
 
-        question_block.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#d1d5db"), spaceAfter=4))
         story.extend(question_block)
+        if q_idx < len(questions):
+          story.append(PageBreak())
 
       if page_break_between and idx < len(attempts_data) - 1:
         story.append(PageBreak())
@@ -2499,7 +3543,7 @@ def pdf():
 
     filename = f"evidence_{class_code}_{quiz_code}.pdf".replace(" ", "_")
     return send_file(pdf_buf, mimetype="application/pdf",
-                     as_attachment=True, download_name=filename)
+                     as_attachment=not _request_flag(request.args.get("inline")), download_name=filename)
 
 
 @app.route("/admin/reimport-candidates")
@@ -2611,114 +3655,238 @@ def evidence():
     )
 
 
-@app.route("/evidence/planner")
+@app.route("/evidence/planner", methods=["GET", "POST"])
 def evidence_planner():
+  if request.method == "POST":
+    class_code = request.form.get("class_code", "").strip()
+    quiz_codes_raw = request.form.get("quiz_codes", "").strip()
+    merge_groups_raw = request.form.get("merge_groups", "").strip()
+    show_done = _request_flag(request.form.get("show_done"))
+    selected_candidate_nos = [value.strip() for value in request.form.getlist("selected_candidate") if value.strip()]
+    evidence_rows = load_existing_evidence_rows()
+    current_state = load_planner_student_state([row["candidate_no"] for row in evidence_rows])
+    visible_candidate_nos = [
+      row["candidate_no"]
+      for row in evidence_rows
+      if show_done or not current_state.get(row["candidate_no"], {}).get("is_done", False)
+    ]
+    try_quiz_fit_set = {value.strip() for value in request.form.getlist("try_quiz_fit_candidate") if value.strip()}
+    done_set = {value.strip() for value in request.form.getlist("done_candidate") if value.strip()}
+    updated_state = {}
+    merged_state = dict(current_state)
+    for candidate_no in visible_candidate_nos:
+      previous_state = current_state.get(candidate_no, {})
+      state = {
+        "try_quiz_fit": candidate_no in try_quiz_fit_set,
+        "is_done": candidate_no in done_set,
+        "excluded_existing_labels": list(previous_state.get("excluded_existing_labels", [])),
+        "excluded_quiz_codes": list(previous_state.get("excluded_quiz_codes", [])),
+        "saved_quiz_codes": list(previous_state.get("saved_quiz_codes", [])),
+        "saved_quiz_label": str(previous_state.get("saved_quiz_label", "") or "").strip(),
+      }
+      updated_state[candidate_no] = state
+      merged_state[candidate_no] = state
+    save_planner_student_state(updated_state)
+
+    redirect_params = []
+    if class_code:
+      redirect_params.append(("class_code", class_code))
+    if quiz_codes_raw:
+      redirect_params.append(("quiz_codes", quiz_codes_raw))
+    if merge_groups_raw:
+      redirect_params.append(("merge_groups", merge_groups_raw))
+    if show_done:
+      redirect_params.append(("show_done", "1"))
+    for candidate_no in selected_candidate_nos:
+      if show_done or not merged_state.get(candidate_no, {}).get("is_done", False):
+        redirect_params.append(("selected_candidate", candidate_no))
+    query = urlencode(redirect_params, doseq=True)
+    return redirect(f"/evidence/planner{f'?{query}' if query else ''}")
+
   class_code = request.args.get("class_code", "").strip()
   quiz_codes_raw = request.args.get("quiz_codes", "").strip()
   merge_groups_raw = request.args.get("merge_groups", "").strip()
+  show_done = _request_flag(request.args.get("show_done"))
   selected_candidate_nos = [value.strip() for value in request.args.getlist("selected_candidate") if value.strip()]
-
-  quiz_codes = parse_code_list(quiz_codes_raw)
-  evidence_rows = load_existing_evidence_rows()
-  candidate_map = lookup_candidates_by_candidate_numbers([row["candidate_no"] for row in evidence_rows])
-
-  students = []
-  selected_set = set(selected_candidate_nos)
-  for row in evidence_rows:
-    candidate = candidate_map.get(row["candidate_no"], {})
-    display_name = f"{candidate.get('forename', '')} {candidate.get('surname', '')}".strip() or row["student_name"]
-    students.append({
-      **row,
-      "display_name": display_name,
-      "email": candidate.get("email", ""),
-      "selected": row["candidate_no"] in selected_set,
-    })
-
-  selected_results = []
-  error = None
-  merge_groups = parse_merge_groups(merge_groups_raw, quiz_codes)
-  live_quiz_count = 0
-
-  if class_code or quiz_codes_raw or selected_candidate_nos:
-    if not class_code:
-      error = "Enter a class code."
-    elif not selected_candidate_nos:
-      error = "Select at least one student."
-    else:
-      try:
-        if quiz_codes:
-          raw_by_quiz = fetch_quiz_attempt_groups(class_code, quiz_codes, include_questions=True)
-          live_quiz_infos = _summaries_from_groups(raw_by_quiz)
-        else:
-          live_quiz_infos, raw_by_quiz = discover_quiz_summaries(class_code)
-
-        student_score_map = build_student_quiz_score_map(raw_by_quiz)
-        excluded_quiz_codes = {code.lower() for code in CSV_EVIDENCE_QUIZ_CODE_MAP.values()}
-        live_quiz_count = sum(
-          1
-          for info in live_quiz_infos
-          if str(info.get("quiz_code") or "").strip().lower() not in excluded_quiz_codes
-        )
-
-        for student in students:
-          if not student["selected"]:
-            continue
-          email = (student.get("email") or "").lower()
-          score_map = student_score_map.get(email, {}) if email else {}
-          existing_candidates = build_existing_evidence_candidates(student["existing_items"])
-          quiz_candidates = build_planner_quiz_candidates(
-            score_map,
-            excluded_quiz_codes=excluded_quiz_codes,
-          )
-          current_best = choose_top_evidence_pieces(existing_candidates, top_n=3)
-          current_prediction = summarise_evidence_prediction(current_best)
-          better_quiz_options = find_better_quiz_evidence(existing_candidates, quiz_candidates, top_n=3)
-          best_available = choose_top_evidence_pieces(existing_candidates + quiz_candidates, top_n=3)
-          best_prediction = summarise_evidence_prediction(best_available)
-          improvement = None
-          if current_prediction["percentage"] is not None and best_prediction["percentage"] is not None:
-            improvement = best_prediction["percentage"] - current_prediction["percentage"]
-
-          selected_results.append({
-            "candidate_no": student["candidate_no"],
-            "display_name": student["display_name"],
-            "email": student["email"],
-            "existing_items": student["existing_items"],
-            "better_quiz_options": better_quiz_options,
-            "best_available": best_available,
-            "current_prediction": current_prediction,
-            "best_prediction": best_prediction,
-            "improvement": improvement,
-            "quiz_scores": [score_map.get(quiz_code, {"percentage": None, "minutes": None}) for quiz_code in quiz_codes],
-            "merged_scores": build_merged_score_rows(score_map, merge_groups),
-          })
-      except requests.HTTPError as e:
-        body = {}
-        try:
-          body = e.response.json()
-        except Exception:
-          pass
-        error = f"API error {e.response.status_code}: {body.get('error', str(e))}"
-      except requests.RequestException as e:
-        error = f"Request failed: {e}"
-      except Exception as e:
-        error = f"Error: {e}"
+  planner_data = build_evidence_planner_view_data(
+    class_code=class_code,
+    quiz_codes_raw=quiz_codes_raw,
+    merge_groups_raw=merge_groups_raw,
+    show_done=show_done,
+    selected_candidate_nos=selected_candidate_nos,
+  )
 
   return render_template_string(
     PLANNER_TEMPLATE,
-    class_code=class_code,
-    quiz_codes=quiz_codes,
-    quiz_codes_raw=quiz_codes_raw,
-    merge_groups=merge_groups,
-    merge_groups_raw=merge_groups_raw,
-    students=students,
-    selected_results=selected_results,
-    error=error,
-    live_quiz_count=live_quiz_count,
+    class_code=planner_data["class_code"],
+    quiz_codes=planner_data["quiz_codes"],
+    quiz_codes_raw=planner_data["quiz_codes_raw"],
+    merge_groups=planner_data["merge_groups"],
+    merge_groups_raw=planner_data["merge_groups_raw"],
+    students=planner_data["students"],
+    visible_students=planner_data["visible_students"],
+    show_done=planner_data["show_done"],
+    selected_candidate_nos=planner_data["selected_candidate_nos"],
+    selected_results=planner_data["selected_results"],
+    error=planner_data["error"],
+    live_quiz_count=planner_data["live_quiz_count"],
     grade_of=grade_suggestion,
     grade_class_of=grade_badge_class,
     grade_thresholds=grade_threshold_rows(),
   )
+
+
+@app.route("/evidence/planner/export")
+def evidence_planner_export():
+  class_code = request.args.get("class_code", "").strip()
+  quiz_codes_raw = request.args.get("quiz_codes", "").strip()
+  merge_groups_raw = request.args.get("merge_groups", "").strip()
+  show_done = _request_flag(request.args.get("show_done"))
+  selected_candidate_nos = [value.strip() for value in request.args.getlist("selected_candidate") if value.strip()]
+  include_all_files = _request_flag(request.args.get("include_all_files"))
+  flatten_folders = _request_flag(request.args.get("flatten_folders"))
+
+  planner_data = build_evidence_planner_view_data(
+    class_code=class_code,
+    quiz_codes_raw=quiz_codes_raw,
+    merge_groups_raw=merge_groups_raw,
+    show_done=show_done,
+    selected_candidate_nos=selected_candidate_nos,
+  )
+  if planner_data["error"]:
+    return planner_data["error"], 400
+  if not planner_data["selected_results"]:
+    return "No selected students to export.", 400
+
+  zip_buf = _planner_build_export_zip(
+    planner_data,
+    include_all_files=include_all_files,
+    flatten_folders=flatten_folders,
+  )
+  if flatten_folders:
+    filename = "evidence_planner_export_flat_all.zip" if include_all_files else "evidence_planner_export_flat_best3.zip"
+  else:
+    filename = "evidence_planner_export_all.zip" if include_all_files else "evidence_planner_export_best3.zip"
+  return send_file(
+    zip_buf,
+    mimetype="application/zip",
+    as_attachment=True,
+    download_name=filename,
+  )
+
+
+@app.route("/evidence/planner/toggle", methods=["POST"])
+def evidence_planner_toggle():
+  candidate_no = request.form.get("candidate_no", "").strip()
+  toggle_type = request.form.get("toggle_type", "").strip()
+  toggle_values = parse_code_list(request.form.get("toggle_values", ""))
+  if not candidate_no or toggle_type not in {"existing", "quiz"} or not toggle_values:
+    abort(400)
+
+  current_state = load_planner_student_state([candidate_no]).get(candidate_no, {
+    "try_quiz_fit": False,
+    "is_done": False,
+    "excluded_existing_labels": [],
+    "excluded_quiz_codes": [],
+    "saved_quiz_codes": [],
+    "saved_quiz_label": "",
+  })
+  updated_state = {
+    **current_state,
+    "excluded_existing_labels": list(current_state.get("excluded_existing_labels", [])),
+    "excluded_quiz_codes": list(current_state.get("excluded_quiz_codes", [])),
+    "saved_quiz_codes": list(current_state.get("saved_quiz_codes", [])),
+    "saved_quiz_label": str(current_state.get("saved_quiz_label", "") or "").strip(),
+  }
+  if toggle_type == "existing":
+    updated_state["excluded_existing_labels"] = toggle_saved_values(updated_state["excluded_existing_labels"], toggle_values)
+  else:
+    updated_state["excluded_quiz_codes"] = toggle_saved_values(updated_state["excluded_quiz_codes"], toggle_values)
+  save_planner_student_state({candidate_no: updated_state})
+
+  redirect_params = []
+  class_code = request.form.get("class_code", "").strip()
+  quiz_codes_raw = request.form.get("quiz_codes", "").strip()
+  merge_groups_raw = request.form.get("merge_groups", "").strip()
+  show_done = _request_flag(request.form.get("show_done"))
+  if class_code:
+    redirect_params.append(("class_code", class_code))
+  if quiz_codes_raw:
+    redirect_params.append(("quiz_codes", quiz_codes_raw))
+  if merge_groups_raw:
+    redirect_params.append(("merge_groups", merge_groups_raw))
+  if show_done:
+    redirect_params.append(("show_done", "1"))
+  for selected_candidate in [value.strip() for value in request.form.getlist("selected_candidate") if value.strip()]:
+    redirect_params.append(("selected_candidate", selected_candidate))
+  query = urlencode(redirect_params, doseq=True)
+  return redirect(f"/evidence/planner{f'?{query}' if query else ''}")
+
+
+@app.route("/evidence/planner/save-combo", methods=["POST"])
+def evidence_planner_save_combo():
+  candidate_no = request.form.get("candidate_no", "").strip()
+  combo_action = request.form.get("combo_action", "save").strip()
+  combo_codes = parse_code_list(request.form.get("combo_codes", ""))
+  combo_label = request.form.get("combo_label", "").strip()
+  if not candidate_no:
+    abort(400)
+
+  current_state = load_planner_student_state([candidate_no]).get(candidate_no, {
+    "try_quiz_fit": False,
+    "is_done": False,
+    "excluded_existing_labels": [],
+    "excluded_quiz_codes": [],
+    "saved_quiz_codes": [],
+    "saved_quiz_label": "",
+  })
+  updated_state = {
+    **current_state,
+    "excluded_existing_labels": list(current_state.get("excluded_existing_labels", [])),
+    "excluded_quiz_codes": list(current_state.get("excluded_quiz_codes", [])),
+    "saved_quiz_codes": list(current_state.get("saved_quiz_codes", [])),
+    "saved_quiz_label": str(current_state.get("saved_quiz_label", "") or "").strip(),
+  }
+  if combo_action == "clear":
+    updated_state["saved_quiz_codes"] = []
+    updated_state["saved_quiz_label"] = ""
+  else:
+    if not combo_codes:
+      abort(400)
+    updated_state["saved_quiz_codes"] = combo_codes
+    updated_state["saved_quiz_label"] = combo_label or ", ".join(combo_codes)
+
+  save_planner_student_state({candidate_no: updated_state})
+
+  redirect_params = []
+  class_code = request.form.get("class_code", "").strip()
+  quiz_codes_raw = request.form.get("quiz_codes", "").strip()
+  merge_groups_raw = request.form.get("merge_groups", "").strip()
+  show_done = _request_flag(request.form.get("show_done"))
+  if class_code:
+    redirect_params.append(("class_code", class_code))
+  if quiz_codes_raw:
+    redirect_params.append(("quiz_codes", quiz_codes_raw))
+  if merge_groups_raw:
+    redirect_params.append(("merge_groups", merge_groups_raw))
+  if show_done:
+    redirect_params.append(("show_done", "1"))
+  for selected_candidate in [value.strip() for value in request.form.getlist("selected_candidate") if value.strip()]:
+    redirect_params.append(("selected_candidate", selected_candidate))
+  query = urlencode(redirect_params, doseq=True)
+  return redirect(f"/evidence/planner{f'?{query}' if query else ''}")
+
+
+@app.route("/evidence/planner/file")
+def evidence_planner_file():
+  candidate_no = request.args.get("candidate_no", "").strip()
+  relative_path = request.args.get("path", "").strip()
+  file_path = resolve_external_evidence_file(candidate_no, relative_path)
+  if file_path is None:
+    abort(404)
+
+  mimetype, _ = mimetypes.guess_type(file_path)
+  return send_file(file_path, mimetype=mimetype or "application/octet-stream", as_attachment=False)
 
 
 @app.route("/evidence/pdf")
@@ -2754,7 +3922,7 @@ def evidence_pdf():
 
     filename = f"evidence_{class_code}_{quiz_code}.pdf".replace(" ", "_")
     return send_file(pdf_buf, mimetype="application/pdf",
-                     as_attachment=True, download_name=filename)
+                     as_attachment=not _request_flag(request.args.get("inline")), download_name=filename)
 
 
 @app.route("/evidence/pdf/merged")
@@ -2792,7 +3960,7 @@ def evidence_pdf_merged():
     merged_name = request.args.get("merged_name", "").strip() or "merged_assessment"
     filename = f"evidence_{class_code}_{merged_name}.pdf".replace(" ", "_")
     return send_file(pdf_buf, mimetype="application/pdf",
-                     as_attachment=True, download_name=filename)
+                     as_attachment=not _request_flag(request.args.get("inline")), download_name=filename)
 
 
 @app.route("/debug/all-attempts")
